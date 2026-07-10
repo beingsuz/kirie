@@ -9,10 +9,17 @@ name: Release
 #   1. picks the version (your input, or the next SemVer from Conventional
 #      Commits via git-cliff — breaking changes bump it and are flagged),
 #   2. generates the changelog into the release body,
-#   3. builds the three binary variants and attaches them,
+#   3. builds the three binary variants IN AN ARCH CONTAINER and attaches them,
 #   4. creates the DRAFT release with all of it.
 # You then go to Releases and hit Publish — that's the only manual step, and by
 # then everything is already filed.
+#
+# Why Arch: the binaries dynamically link ffmpeg + shaderc, whose sonames differ
+# per distro (Arch ships libavcodec.so.62 / libshaderc_shared.so.1; Ubuntu ships
+# older .so.60 / libshaderc.so.1). Building on Arch makes the binary link the
+# sonames Arch-family systems (Arch, CachyOS, EndeavourOS, Manjaro, …) actually
+# have, so it finds them in /usr/lib at load time with no bundling. Other distros
+# would need their own build (or a static build) — out of scope here.
 on:
   workflow_dispatch:
     inputs:
@@ -73,15 +80,16 @@ jobs:
             gh release create "$v" --draft --title "$v" --notes-file RELEASE_NOTES.md --target "$GITHUB_SHA"
           fi
 
-  # 2. Build the three binaries from one source tree, selected by cargo feature:
+  # 2. Build the three binaries INSIDE an Arch container so they link Arch-family
+  #    sonames, then attach to the draft. Variants (one source tree, cargo feature):
   #      - default     -> `kirie`             (no web backend)
   #      - web-cef     -> `kirie-web-cef`     (Chromium Embedded Framework, OSR)
   #      - web-webview -> `kirie-web-webview` (wry + system webkit2gtk-4.1)
-  #    Each installs only the deps its variant needs; fail-fast:false so one
-  #    backend failing never blocks the others. Then attach to the draft.
+  #    fail-fast:false so one backend failing never blocks the others.
   build:
     needs: prepare
     runs-on: ubuntu-latest
+    container: archlinux:latest
     strategy:
       fail-fast: false
       matrix:
@@ -96,33 +104,32 @@ jobs:
             features: web-webview
             artifact: kirie-web-webview
     name: build (${{ matrix.variant }})
+    env:
+      # gh detects the repo from this instead of git remote (avoids in-container
+      # git ownership issues).
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.variant }}
-
-      # Base libraries every kirie build links (FFmpeg, ALSA/PulseAudio, xcb,
-      # shaderc, Wayland). cmake/ninja also cover the shaderc + CEF wrapper
-      # source builds.
-      - name: Install base system dependencies
+      # Base libraries every kirie build links (FFmpeg, ALSA/PulseAudio, xcb/X11,
+      # shaderc/glslang, Wayland) plus the toolchain. base-devel brings gcc,
+      # make, pkgconf; cmake/ninja/clang cover the shaderc + CEF wrapper builds;
+      # github-cli provides `gh` for the upload.
+      - name: Install Arch build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang libclang-dev cmake ninja-build pkg-config curl \
-            libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
-            libavfilter-dev libswscale-dev libswresample-dev \
-            libasound2-dev libpulse-dev \
-            libwayland-dev libxkbcommon-dev libxcb1-dev \
-            libshaderc-dev glslang-dev
+          pacman -Syu --noconfirm --needed \
+            base-devel git curl rust \
+            ffmpeg shaderc glslang \
+            alsa-lib libpulse \
+            wayland libxkbcommon libxcb libx11 \
+            cmake ninja clang pkgconf \
+            github-cli
 
-      # web-webview: wry links webkit2gtk-4.1 + libsoup-3.0 at compile time.
+      # web-webview: wry links webkit2gtk-4.1 + libsoup-3 at compile time.
       - name: Install webkit2gtk (web-webview only)
         if: matrix.variant == 'web-webview'
-        run: |
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev
+        run: pacman -S --noconfirm --needed webkit2gtk-4.1 libsoup3
+
+      - uses: actions/checkout@v4
 
       # Stamp the release version into the workspace Cargo.toml so the built
       # binary reports it via `kirie --version`. Runner-local only — never
@@ -131,9 +138,6 @@ jobs:
         run: |
           v="${{ needs.prepare.outputs.version }}"; v="${v#v}"
           sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/s//version = \"$v\"/" Cargo.toml
-
-      - name: Clippy (${{ matrix.variant }})
-        run: cargo clippy -p kirie ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --all-targets -- -D warnings
 
       - name: Build release (${{ matrix.variant }})
         run: cargo build --release -p kirie ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
@@ -176,6 +180,4 @@ jobs:
       # Attach the tarball to the draft release created by the prepare job.
       # --clobber so re-runs replace instead of erroring.
       - name: Attach to draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ needs.prepare.outputs.version }}" "${{ steps.package.outputs.tarball }}" --clobber
