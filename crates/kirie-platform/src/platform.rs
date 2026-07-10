@@ -274,6 +274,22 @@ impl PlatformState {
                     }
                 }
             }
+            RenderCommand::SetProperty { screen, key, value } => {
+                // Live property change: update the output's renderer in place and
+                // repaint so it shows next frame (no reload). No-op if the output
+                // or its renderer isn't up yet.
+                let Some(idx) = self.output_index(&screen) else { return };
+                let ctx = &mut self.outputs[idx];
+                if let Some(renderer) = ctx.renderer.as_mut() {
+                    renderer.set_property(&key, &value);
+                    if ctx.configured && !ctx.frame_pending {
+                        let qh = self.qh.clone();
+                        ctx.wl_surface().frame(&qh, ctx.wl_surface().clone());
+                        ctx.frame_pending = true;
+                        ctx.wl_surface().commit();
+                    }
+                }
+            }
             RenderCommand::SwapLocal { screen, build_local } => {
                 // Render-thread build (CEF web is !Send). Blocks the loop for the
                 // build's duration — a brief hitch on the current wallpaper — then

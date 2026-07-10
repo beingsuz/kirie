@@ -93,6 +93,15 @@ struct PassGpu {
     /// so a flat projection-size resolution leaks their padding as a solid
     /// block (docs/format-tex.md §8.1; docs/render-architecture.md §7.1).
     tex_resolution: [[f32; 4]; 8],
+    /// Re-resolution inputs for a live `setProperty` (docs §4.9): the material
+    /// pass (its `constantshadervalues` keep their property bindings) plus the
+    /// vs/fs shader-parameter reflection. On a property change the pass's
+    /// constants are re-resolved and `{vs,fs}_params` recomputed, so the next
+    /// frame's `_WEGlobals` pack (which reads `{vs,fs}_params`) shows the new
+    /// value — no rebuild.
+    material_pass: kirie_scene::material::Pass,
+    params_vs: Vec<kirie_shader::reflect::Parameter>,
+    params_fs: Vec<kirie_shader::reflect::Parameter>,
 }
 
 /// One renderable image object with its FBOs and passes.
@@ -175,8 +184,16 @@ pub struct SceneRenderer {
     /// (docs/scripting-api.md §3; SPEC.md §V3). Ticked once per frame.
     script: Option<ScriptHost>,
     /// The scene camera (eye/center/up/fov/near/far) — the 3D MODEL objects
-    /// build their perspective from it each frame (docs §7.2).
+    /// build their perspective from it each frame (docs §7.2). `fov` is a
+    /// property-bound `UserSetting`, re-resolved on a live `setProperty`.
     camera: kirie_scene::scene::Camera,
+    /// The property bag (declared user props + `--set-property` overrides),
+    /// retained so a live `setProperty` (docs §4.9) can update a value and
+    /// re-resolve the affected shader params / camera / general in place.
+    bag: kirie_scene::PropertyBag,
+    /// The resolved `general` block, re-resolved on `setProperty` to update
+    /// bloom / ambient / skylight / clearcolor live.
+    general: kirie_scene::scene::General,
     /// The 3D models' shared private depth buffer, allocated once at the scene
     /// size when the scene has any model object (SPEC.md §V5). `None` ⇒ no model.
     model_depth: Option<wgpu::TextureView>,
@@ -204,6 +221,16 @@ impl SceneRenderer {
         let device = target.device;
         let queue = target.queue;
         let scene = &model.scene;
+
+        // Retain the property bag (the resolved user-property snapshot) + the
+        // general block so a live `setProperty` can re-resolve in place. The
+        // snapshot carries every declared property's current value, which is what
+        // a re-resolution reads.
+        let mut bag = kirie_scene::PropertyBag::new();
+        for (name, value) in user_props {
+            bag.insert(name.clone(), value.clone());
+        }
+        let general = scene.general.clone();
 
         let (proj_w, proj_h) = projection_size(model);
         if proj_w == 0 || proj_h == 0 {
@@ -445,6 +472,8 @@ impl SceneRenderer {
             scene_fbo,
             scene_snapshot,
             bloom,
+            bag,
+            general,
             blit_pipeline,
             blit_bind,
             blit_window,
@@ -949,6 +978,8 @@ fn build_object(
             pipeline,
             vs_globals,
             fs_globals,
+            vs_params: params_vs,
+            fs_params: params_fs,
             ..
         } = built_pass;
 
@@ -970,6 +1001,9 @@ fn build_object(
             model_matrix,
             blending: raw_pass.blending,
             tex_resolution,
+            params_vs,
+            params_fs,
+            material_pass: raw_pass,
         });
     }
     let _ = screen_mvp; // screen MVP applied per-frame via builtins.
@@ -1222,6 +1256,79 @@ impl Renderer for SceneRenderer {
         }
 
         self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Live `setProperty` (doc §4.9): parse `value` to the property's declared
+    /// type, update the bag, then re-resolve the affected shader parameters,
+    /// camera fov and general (bloom/ambient/skylight/clearcolor) in place — all
+    /// read per-frame, so the next frame shows the change with no rebuild.
+    ///
+    /// Object visibility/transform bindings are not yet re-resolved live (they
+    /// still apply on the next scene load); the render-uniform properties users
+    /// tweak (colors, shader constants, fov, bloom) are covered.
+    fn set_property(&mut self, key: &str, value: &str) {
+        if !self.bag.set_from_str(key, value) {
+            return; // unknown key or unparseable — nothing changed
+        }
+        // Material constants → shader params (the bulk: colors, hue, coloring…).
+        for item in &mut self.items {
+            if let SceneItem::Image(o) = item {
+                for pass in &mut o.passes {
+                    kirie_scene::resolve::resolve_constants(
+                        &mut pass.material_pass.constantshadervalues,
+                        &self.bag,
+                    );
+                    pass.vs_params = resolve_params(&pass.params_vs, &pass.material_pass);
+                    pass.fs_params = resolve_params(&pass.params_fs, &pass.material_pass);
+                }
+            }
+        }
+        // Camera fov (model perspective, rebuilt each frame from camera.fov).
+        self.camera.reresolve(&self.bag);
+        // General: ambient / skylight / clearcolor + bloom, all read per-frame.
+        self.general.resolve(&self.bag);
+        self.ambient = [
+            self.general.ambientcolor.value[0],
+            self.general.ambientcolor.value[1],
+            self.general.ambientcolor.value[2],
+        ];
+        self.skylight = [
+            self.general.skylightcolor.value[0],
+            self.general.skylightcolor.value[1],
+            self.general.skylightcolor.value[2],
+        ];
+        let clear = self.general.clearcolor.value;
+        self.clear_color = wgpu::Color {
+            r: f64::from(clear[0]),
+            g: f64::from(clear[1]),
+            b: f64::from(clear[2]),
+            a: 1.0,
+        };
+        if let Some(bloom) = &self.bloom {
+            bloom.set_params(
+                &self.queue,
+                self.general.bloomstrength.value,
+                self.general.bloomthreshold.value,
+            );
+        }
+        // Script-driven properties (a SceneScript's `applyUserProperties` — e.g. a
+        // `coloring` combo that recolors the scene, or a layer-switcher combo):
+        // fire the change handler and apply its typed updates live (docs §5.3).
+        let value = self.bag.get(key).cloned();
+        let updates = match (self.script.as_mut(), value.as_ref()) {
+            (Some(script), Some(v)) => script.apply_user_property(key, v),
+            _ => Vec::new(),
+        };
+        for u in &updates {
+            if matches!(u.target, PropTarget::Visible)
+                && let kirie_script::ScriptValue::Bool(v) = &u.value
+            {
+                self.visible_by_id.insert(u.object_id, *v);
+            }
+        }
+        if !updates.is_empty() {
+            apply_script_updates(&mut self.items, &updates);
+        }
     }
 }
 

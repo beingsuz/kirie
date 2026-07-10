@@ -331,9 +331,24 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
         }
         Command::Property { screen, key, value } => {
             // doc §4.9: error if the screen has no registered background. The
-            // override is recorded regardless (stored-before-validation), then
-            // applied by later scene loads (P4/P5).
-            state.properties.insert(key, value);
+            // override is recorded regardless (stored-before-validation) so a
+            // later swap/reload picks it up...
+            state.properties.insert(key.clone(), value.clone());
+            // ...and applied LIVE to the running renderer on `screen` (a real
+            // monitor). `stage` maps here with an empty screen, which targets no
+            // output, so it only records (no live effect) — exactly its role.
+            if let Some(cmd_tx) = state
+                .swap
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|s| s.cmd_tx.clone()))
+            {
+                let _ = cmd_tx.send(RenderCommand::SetProperty {
+                    screen: screen.clone(),
+                    key,
+                    value,
+                });
+            }
             if state.screens.get(&screen).is_some_and(|e| e.bg.is_some()) {
                 CommandOutcome::Ok
             } else {

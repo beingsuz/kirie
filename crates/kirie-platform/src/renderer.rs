@@ -54,6 +54,13 @@ pub trait Renderer {
     /// each monitor renders at its own compositor-driven cadence
     /// (docs/render-architecture.md §2.3).
     fn render(&mut self, view: &wgpu::TextureView, size: SurfaceSize, dt: f32);
+
+    /// Apply a live property override (socket `property <key> <value>`, doc
+    /// §4.9): update the running wallpaper in place so the change shows on the
+    /// next frame — no reload. `value` is the raw string; the renderer parses it
+    /// to the property's declared type. Default: no-op (renderers with no live
+    /// properties, e.g. image/video/black, ignore it).
+    fn set_property(&mut self, _key: &str, _value: &str) {}
 }
 
 /// Factory invoked once per output surface to build its [`Renderer`].
@@ -155,5 +162,16 @@ pub enum RenderCommand {
         screen: String,
         /// Render-thread builder producing the (possibly `!Send`) renderer.
         build_local: BuildLocalFn,
+    },
+    /// Apply a live property override to `screen`'s running renderer (socket
+    /// `property`, doc §4.9): call [`Renderer::set_property`] and repaint, so the
+    /// change shows next frame — no reload.
+    SetProperty {
+        /// Target output name; `"*"` = the first output.
+        screen: String,
+        /// Property key.
+        key: String,
+        /// Raw value string (the renderer parses it to the declared type).
+        value: String,
     },
 }

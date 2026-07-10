@@ -11,7 +11,7 @@ use crate::material::{EffectFile, Material, ModelFile};
 use crate::object::{Effect, ImageObject, Object, ObjectKind, ParticleObject};
 use crate::particle::ParticleSystem;
 use crate::property::{PropertyBag, Resolvable};
-use crate::scene::{General, Scene};
+use crate::scene::{Camera, General, Scene};
 use crate::user::{ConstantValues, UserRef, UserSetting};
 
 /// Resolve one user setting against the bag (docs/format-scene-json.md §3.2/§3.3).
@@ -37,15 +37,28 @@ fn resolve_us<T: Resolvable + Clone>(us: &mut UserSetting<T>, bag: &PropertyBag)
 }
 
 /// Resolve a `constantshadervalues` map in place.
-fn resolve_constants(constants: &mut ConstantValues, bag: &PropertyBag) {
+/// Re-resolve a material pass's `constantshadervalues` against `bag` in place.
+/// Bindings persist after the initial resolve (docs §3.2), so a live
+/// `setProperty` can call this to update a running pass's shader-parameter values
+/// without a rebuild.
+pub fn resolve_constants(constants: &mut ConstantValues, bag: &PropertyBag) {
     for us in constants.values_mut() {
         resolve_us(us, bag);
     }
 }
 
+impl Camera {
+    /// Re-resolve the property-bound camera fields (currently `fov`) against the
+    /// bag — for a live `setProperty` on the FOV slider (docs §3.2).
+    pub fn reresolve(&mut self, bag: &PropertyBag) {
+        resolve_us(&mut self.fov, bag);
+    }
+}
+
 impl General {
-    /// Resolve every property-bound `general` field against the bag.
-    fn resolve(&mut self, bag: &PropertyBag) {
+    /// Resolve every property-bound `general` field against the bag. Public so a
+    /// live `setProperty` can re-resolve bloom/ambient/clearcolor etc. in place.
+    pub fn resolve(&mut self, bag: &PropertyBag) {
         resolve_us(&mut self.ambientcolor, bag);
         resolve_us(&mut self.skylightcolor, bag);
         resolve_us(&mut self.clearcolor, bag);

@@ -53,6 +53,10 @@ pub(crate) struct Bloom {
     blur_x_bind: wgpu::BindGroup,
     blur_y_bind: wgpu::BindGroup,
     combine_bind: wgpu::BindGroup,
+    /// The bright-pass uniform buffer + the scene texel size, retained so a live
+    /// `setProperty` on bloomstrength/bloomthreshold can re-upload the params.
+    bright_ub: wgpu::Buffer,
+    texel: [f32; 2],
 }
 
 impl Bloom {
@@ -196,7 +200,26 @@ impl Bloom {
             blur_x_bind,
             blur_y_bind,
             combine_bind,
+            bright_ub,
+            texel,
         }
+    }
+
+    /// Live-update the bright-pass strength/threshold (a `setProperty` on
+    /// `bloomstrength`/`bloomthreshold`); the next frame's passes use the new
+    /// values. Tint stays neutral, texel unchanged.
+    pub(crate) fn set_params(&self, queue: &wgpu::Queue, strength: f32, threshold: f32) {
+        queue.write_buffer(
+            &self.bright_ub,
+            0,
+            bytemuck::bytes_of(&BrightParams {
+                texel: self.texel,
+                strength,
+                threshold,
+                tint: [1.0, 1.0, 1.0],
+                _pad: 0.0,
+            }),
+        );
     }
 
     /// Record the four bloom passes into `encoder`. Must run after the scene has

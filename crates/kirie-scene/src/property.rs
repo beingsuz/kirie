@@ -106,6 +106,49 @@ impl PropertyBag {
         self.values.insert(name.into(), value);
     }
 
+    /// Parse a raw `setProperty` / `--set-property` string into `name`'s declared
+    /// type and set it (docs/format-scene-json.md §3.2/§3.4). The target type is
+    /// taken from the current value, so a color stays a color, a slider a number,
+    /// etc.; unknown keys and unparseable values are rejected (returns whether it
+    /// applied). Mirrors the reference `setProperty` typing.
+    pub fn set_from_str(&mut self, name: &str, raw: &str) -> bool {
+        let Some(current) = self.values.get(name) else {
+            return false;
+        };
+        let parsed = match current {
+            PropertyValue::Bool(_) => {
+                PropertyValue::Bool(matches!(raw.trim(), "1" | "true" | "True" | "TRUE"))
+            }
+            PropertyValue::Number(_) => match raw.trim().parse::<f64>() {
+                Ok(n) => PropertyValue::Number(n),
+                Err(_) => return false,
+            },
+            PropertyValue::Color(_) => {
+                // "r g b" (or "r g b a"), space-separated floats (§3.4 color form).
+                let mut c = [0.0f32; 4];
+                c[3] = 1.0;
+                let mut any = false;
+                for (i, tok) in raw.split_whitespace().take(4).enumerate() {
+                    match tok.parse::<f32>() {
+                        Ok(v) => {
+                            c[i] = v;
+                            any = true;
+                        }
+                        Err(_) => return false,
+                    }
+                }
+                if !any {
+                    return false;
+                }
+                PropertyValue::Color(c)
+            }
+            // Combos compare by their selected option string (§3.3); text verbatim.
+            PropertyValue::Combo(_) => PropertyValue::Combo(raw.trim().to_owned()),
+            PropertyValue::Text(_) => PropertyValue::Text(raw.to_owned()),
+        };
+        self.set(name, parsed)
+    }
+
     /// Number of declared properties.
     pub fn len(&self) -> usize {
         self.values.len()

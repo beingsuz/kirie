@@ -27,7 +27,9 @@ use kirie_audio::AudioSpectrum;
 use kirie_scene::object::ObjectKind;
 use kirie_scene::user::ScriptBinding;
 use kirie_scene::{PropertyValue, SceneModel};
-use kirie_script::{AudioBuffers, HostFrame, LayerState, SceneOp, SceneState, ScriptEngine, ScriptValue};
+use kirie_script::{
+    AudioBuffers, HostFrame, LayerState, SceneOp, SceneState, ScriptEngine, ScriptValue, TickOutput,
+};
 use serde_json::{Map, Value};
 
 /// Which live render value a scripted property (or a script `SetProperty` op)
@@ -240,6 +242,35 @@ impl ScriptHost {
                 return Vec::new();
             }
         };
+        self.process_output(output)
+    }
+
+    /// Fire `applyUserProperties({key: value})` on the scene's scripts for a live
+    /// `setProperty` (docs §5.3) and return the resulting property updates. Also
+    /// refreshes the cached `engine.userProperties` so later `update()` ticks see
+    /// the new value. This is what makes a **script-driven** property (e.g. a
+    /// `coloring` combo that recolors the scene) update live, not just direct
+    /// material/camera/general bindings.
+    pub fn apply_user_property(
+        &mut self,
+        key: &str,
+        value: &kirie_scene::PropertyValue,
+    ) -> Vec<PropUpdate> {
+        let sv = prop_to_script(value);
+        self.user_props.insert(key.to_owned(), sv.clone());
+        match self.engine.dispatch_user_property(key.to_owned(), sv) {
+            Ok(output) => self.process_output(output),
+            Err(e) => {
+                tracing::warn!(error = %e, "script user-property dispatch failed (unchanged)");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Turn a script [`TickOutput`] into the typed [`PropUpdate`]s to apply,
+    /// updating the cached layer snapshot as it goes. Shared by [`Self::tick`] and
+    /// [`Self::apply_user_property`].
+    fn process_output(&mut self, output: TickOutput) -> Vec<PropUpdate> {
         for err in &output.errors {
             tracing::debug!(error = %err, "script runtime error (script stays loaded, V9)");
         }
