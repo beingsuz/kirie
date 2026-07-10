@@ -269,98 +269,109 @@ impl Default for Builtins {
     }
 }
 
+/// Max components in any builtin member — `g_AudioSpectrum64*` (64 floats).
+/// The pack scratch is sized to this so no member overflows it.
+const MAX_MEMBER_FLOATS: usize = 64;
+
 impl Builtins {
-    /// The scalar/vector/matrix components for a builtin member name, in the
-    /// natural component order (matrices column-major). `None` for a name this
-    /// snapshot does not provide (a material parameter — resolved elsewhere).
+    /// Write a builtin member's components (natural order, matrices column-major)
+    /// into `buf` and return the count. `None` for a name this snapshot does not
+    /// provide (a material parameter — resolved elsewhere). Allocation-free
+    /// (SPEC §V5); `buf` must hold at least [`MAX_MEMBER_FLOATS`] floats.
     #[must_use]
-    pub fn components(&self, name: &str) -> Option<Vec<f32>> {
+    pub fn components_into(&self, name: &str, buf: &mut [f32]) -> Option<usize> {
         // Texture resolution slots.
         if let Some(rest) = name.strip_prefix("g_Texture")
             && let Some(idx) = rest.strip_suffix("Resolution")
             && let Ok(i) = idx.parse::<usize>()
         {
-            return Some(
-                self.texture_resolution
-                    .get(i)
-                    .copied()
-                    .unwrap_or([0.0; 4])
-                    .to_vec(),
-            );
+            buf[..4].copy_from_slice(&self.texture_resolution.get(i).copied().unwrap_or([0.0; 4]));
+            return Some(4);
         }
-        Some(match name {
-            "g_Time" => vec![self.time],
-            "g_Daytime" => vec![self.daytime],
-            "g_Brightness" => vec![self.brightness],
-            "g_Alpha" | "g_UserAlpha" => vec![self.alpha],
-            "g_TextureReductionScale" => vec![1.0],
-            "g_Color" | "g_CompositeColor" => self.color[..3].to_vec(),
-            "g_Color4" => self.color.to_vec(),
-            "g_LightAmbientColor" => self.ambient.to_vec(),
-            "g_LightSkylightColor" => self.skylight.to_vec(),
-            "g_PointerPosition" => self.pointer.to_vec(),
-            "g_PointerPositionLast" => self.pointer_last.to_vec(),
-            "g_TexelSize" => self.texel_size.to_vec(),
-            "g_TexelSizeHalf" => vec![self.texel_size[0] * 0.5, self.texel_size[1] * 0.5],
+        let n = match name {
+            "g_Time" => set(buf, &[self.time]),
+            "g_Daytime" => set(buf, &[self.daytime]),
+            "g_Brightness" => set(buf, &[self.brightness]),
+            "g_Alpha" | "g_UserAlpha" => set(buf, &[self.alpha]),
+            "g_TextureReductionScale" => set(buf, &[1.0]),
+            "g_Color" | "g_CompositeColor" => set(buf, &self.color[..3]),
+            "g_Color4" => set(buf, &self.color),
+            "g_LightAmbientColor" => set(buf, &self.ambient),
+            "g_LightSkylightColor" => set(buf, &self.skylight),
+            "g_PointerPosition" => set(buf, &self.pointer),
+            "g_PointerPositionLast" => set(buf, &self.pointer_last),
+            "g_TexelSize" => set(buf, &self.texel_size),
+            "g_TexelSizeHalf" => set(buf, &[self.texel_size[0] * 0.5, self.texel_size[1] * 0.5]),
             // width, height, aspect — derived from the texel size (= 1/size).
             "g_Screen" => {
                 let w = 1.0 / self.texel_size[0];
                 let h = 1.0 / self.texel_size[1];
-                vec![w, h, w / h]
+                set(buf, &[w, h, w / h])
             }
-            "g_Texture0Translation" => self.texture0_translation.to_vec(),
-            "g_Texture0Rotation" => self.texture0_rotation.to_vec(),
-            "g_ModelViewProjectionMatrix" | "g_EffectModelViewProjectionMatrix" => self.mvp.to_vec(),
-            "g_ModelViewProjectionMatrixInverse" => super::matrix::inverse(&self.mvp).to_vec(),
-            "g_ModelMatrix" | "g_EffectModelMatrix" => self.model.to_vec(),
-            "g_ModelMatrixInverse" => super::matrix::inverse(&self.model).to_vec(),
-            "g_ViewProjectionMatrix" => self.view_projection.to_vec(),
-            "g_EffectTextureProjectionMatrix" | "g_EffectTextureProjectionMatrixInverse" => IDENTITY.to_vec(),
-            "g_NormalModelMatrix" => vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            "g_Texture0Translation" => set(buf, &self.texture0_translation),
+            "g_Texture0Rotation" => set(buf, &self.texture0_rotation),
+            "g_ModelViewProjectionMatrix" | "g_EffectModelViewProjectionMatrix" => set(buf, &self.mvp),
+            "g_ModelViewProjectionMatrixInverse" => set(buf, &super::matrix::inverse(&self.mvp)),
+            "g_ModelMatrix" | "g_EffectModelMatrix" => set(buf, &self.model),
+            "g_ModelMatrixInverse" => set(buf, &super::matrix::inverse(&self.model)),
+            "g_ViewProjectionMatrix" => set(buf, &self.view_projection),
+            "g_EffectTextureProjectionMatrix" | "g_EffectTextureProjectionMatrixInverse" => set(buf, &IDENTITY),
+            "g_NormalModelMatrix" => set(buf, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
             // Particle/model additions (docs §8.3). The 2D image path does not
             // drive these; supply non-degenerate defaults (unit axes, an eye on
             // +Z, the reference's 0.05 refract) so a shader that reads them gets
             // sane values instead of zeros.
-            "g_OrientationUp" | "g_ViewUp" => vec![0.0, 1.0, 0.0],
-            "g_OrientationRight" | "g_ViewRight" => vec![1.0, 0.0, 0.0],
-            "g_OrientationForward" => vec![0.0, 0.0, 1.0],
-            "g_EyePosition" => self.eye.to_vec(),
-            "g_RenderVar0" | "g_RenderVar1" => vec![0.0, 0.0, 0.0, 0.0],
-            "g_RefractAmount" => vec![0.05],
+            "g_OrientationUp" | "g_ViewUp" => set(buf, &[0.0, 1.0, 0.0]),
+            "g_OrientationRight" | "g_ViewRight" => set(buf, &[1.0, 0.0, 0.0]),
+            "g_OrientationForward" => set(buf, &[0.0, 0.0, 1.0]),
+            "g_EyePosition" => set(buf, &self.eye),
+            "g_RenderVar0" | "g_RenderVar1" => set(buf, &[0.0, 0.0, 0.0, 0.0]),
+            "g_RefractAmount" => set(buf, &[0.05]),
             // Mono capture: Left and Right feed from the same band array
             // (subsystems-misc.md §1.3 "Consumers"). Silent (all-zero) unless
             // the render loop has copied a live spectrum into these fields.
-            "g_AudioSpectrum16Left" | "g_AudioSpectrum16Right" => self.audio16.to_vec(),
-            "g_AudioSpectrum32Left" | "g_AudioSpectrum32Right" => self.audio32.to_vec(),
-            "g_AudioSpectrum64Left" | "g_AudioSpectrum64Right" => self.audio64.to_vec(),
+            "g_AudioSpectrum16Left" | "g_AudioSpectrum16Right" => set(buf, &self.audio16),
+            "g_AudioSpectrum32Left" | "g_AudioSpectrum32Right" => set(buf, &self.audio32),
+            "g_AudioSpectrum64Left" | "g_AudioSpectrum64Right" => set(buf, &self.audio64),
             _ => return None,
-        })
+        };
+        Some(n)
     }
 }
 
-/// Pack one program's `_WEGlobals` block into a fresh byte buffer sized to
-/// `layout.size` (docs/render-architecture.md §8.3). Each member's bytes come
-/// from `builtins` first, else `params` (resolved material-parameter values by
-/// uniform name); an unresolved member is left zero-filled.
+/// Copy `src` into the head of `buf`, returning `src.len()` (a small helper so
+/// [`Builtins::components_into`] stays a flat match).
+#[inline]
+fn set(buf: &mut [f32], src: &[f32]) -> usize {
+    buf[..src.len()].copy_from_slice(src);
+    src.len()
+}
+
+/// Pack one program's `_WEGlobals` block into `out` (docs/render-architecture.md
+/// §8.3), reusing its capacity — no per-frame allocation (SPEC §V5). Each
+/// member's bytes come from `builtins` first, else `params` (resolved
+/// material-parameter values by uniform name); an unresolved member is left
+/// zero-filled.
 ///
 /// Matrix members are written column-major (16 contiguous floats for a mat4);
 /// `mat3` writes three vec3 columns padded to 16 bytes each. `float[N]` writes
 /// each element on a 16-byte stride (std140).
-#[must_use]
 pub fn pack_globals(
+    out: &mut Vec<u8>,
     layout: &GlobalsLayout,
     builtins: &Builtins,
     params: &BTreeMap<String, Vec<f32>>,
-) -> Vec<u8> {
-    let mut bytes = vec![0u8; layout.size];
+) {
+    out.clear();
+    out.resize(layout.size, 0);
+    let mut scratch = [0.0f32; MAX_MEMBER_FLOATS];
     for member in &layout.members {
-        let comps = builtins
-            .components(&member.name)
-            .or_else(|| params.get(&member.name).cloned());
-        let Some(comps) = comps else { continue };
-        write_member(&mut bytes, member, &comps);
+        if let Some(n) = builtins.components_into(&member.name, &mut scratch) {
+            write_member(out, member, &scratch[..n]);
+        } else if let Some(v) = params.get(&member.name) {
+            write_member(out, member, v);
+        }
     }
-    bytes
 }
 
 /// Write a member's float components at its offset with std140 column/element
@@ -485,7 +496,8 @@ mod tests {
         };
         // A recognizable MVP: translation (7,8,9) → column-major cols in bytes.
         b.mvp = super::super::matrix::translation([7.0, 8.0, 9.0]);
-        let bytes = pack_globals(&layout, &b, &BTreeMap::new());
+        let mut bytes = Vec::new();
+        pack_globals(&mut bytes, &layout, &b, &BTreeMap::new());
         assert_eq!(bytes.len(), 80);
         // g_Time at offset 0.
         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2.5);
@@ -508,7 +520,8 @@ mod tests {
         let mut b = Builtins::default();
         b.audio16[0] = 0.5;
         b.audio16[15] = 0.25;
-        let bytes = pack_globals(&layout, &b, &BTreeMap::new());
+        let mut bytes = Vec::new();
+        pack_globals(&mut bytes, &layout, &b, &BTreeMap::new());
         // FloatArray stride is 16 bytes; the Right block starts right after Left.
         let right_off = layout.members[1].offset;
         let elem = |off: usize| f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
@@ -521,14 +534,16 @@ mod tests {
     #[test]
     fn silent_builtins_pack_zero_audio() {
         let layout = GlobalsLayout::build(&names(&["g_AudioSpectrum64Left"]), &BTreeMap::new());
-        let bytes = pack_globals(&layout, &Builtins::default(), &BTreeMap::new());
+        let mut bytes = Vec::new();
+        pack_globals(&mut bytes, &layout, &Builtins::default(), &BTreeMap::new());
         assert!(bytes.iter().all(|&x| x == 0), "silent spectrum is all-zero (V9)");
     }
 
     #[test]
     fn pack_writes_mat3_with_column_padding() {
         let layout = GlobalsLayout::build(&names(&["g_NormalModelMatrix"]), &BTreeMap::new());
-        let bytes = pack_globals(&layout, &Builtins::default(), &BTreeMap::new());
+        let mut bytes = Vec::new();
+        pack_globals(&mut bytes, &layout, &Builtins::default(), &BTreeMap::new());
         assert_eq!(bytes.len(), 48);
         // Identity mat3: diagonal 1s at column strides of 16.
         let elem = |off: usize| f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());

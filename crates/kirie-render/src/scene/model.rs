@@ -356,6 +356,7 @@ pub(super) fn draw_model(
     time: f32,
     texel: [f32; 2],
     audio: Option<&AudioSpectrum>,
+    scratch: &mut Vec<u8>,
 ) {
     let (fov, near, far) = clamp_camera(camera.fov.value, camera.nearz, camera.farz);
     let projection = matrix::perspective(fov.to_radians(), aspect, near, far);
@@ -430,18 +431,12 @@ pub(super) fn draw_model(
             audio64: audio.map_or([0.0; 64], |a| a.audio64),
         };
         if let Some(ubo) = &mesh.vs_ubo {
-            queue.write_buffer(
-                ubo,
-                0,
-                &pack_globals(&mesh.vs_globals, &builtins, &mesh.vs_params),
-            );
+            pack_globals(scratch, &mesh.vs_globals, &builtins, &mesh.vs_params);
+            queue.write_buffer(ubo, 0, scratch);
         }
         if let Some(ubo) = &mesh.fs_ubo {
-            queue.write_buffer(
-                ubo,
-                0,
-                &pack_globals(&mesh.fs_globals, &builtins, &mesh.fs_params),
-            );
+            pack_globals(scratch, &mesh.fs_globals, &builtins, &mesh.fs_params);
+            queue.write_buffer(ubo, 0, scratch);
         }
         rp.set_pipeline(&mesh.pipeline);
         rp.set_bind_group(0, &mesh.g0_bind, &[]);
@@ -646,6 +641,7 @@ mod tests {
             0.0,
             [1.0 / w as f32, 1.0 / h as f32],
             None,
+            &mut Vec::new(),
         );
         queue.submit(Some(enc.finish()));
 

@@ -155,14 +155,19 @@ pub struct SceneRenderer {
     /// Reused per-frame particle sprite scratch — cleared and refilled in place
     /// so steady-state stepping never reallocates (SPEC.md §V5).
     sprite_scratch: Vec<SpriteInstance>,
+    /// Reused byte buffer for packing each pass's `_WEGlobals` block per frame
+    /// (SPEC §V5: no per-frame allocation — capacity is retained across frames).
+    pack_scratch: Vec<u8>,
     /// The shared text pipeline, built only when the scene has drawable text.
     text_pipeline: Option<TextPipeline>,
     scene_fbo: Fbo,
     /// Persistent snapshot of `scene_fbo` bound wherever a layer samples
     /// `_rt_FullFrameBuffer` (docs §6/§11). Refreshed by a GPU copy immediately
     /// before each post-process layer draws, so the read never aliases the
-    /// write. Same size as `scene_fbo`.
-    scene_snapshot: Fbo,
+    /// write. Same size as `scene_fbo`. `None` when no object samples the scene
+    /// FBO and bloom is off — a proj-size `RGBA16F` target (16–66 MB) not worth
+    /// keeping for a scene that never reads it back.
+    scene_snapshot: Option<Fbo>,
     /// Camera bloom post-process, present when `general.bloom` is enabled
     /// (docs §5). Runs on the composited scene FBO just before the blit.
     bloom: Option<super::bloom::Bloom>,
@@ -445,6 +450,18 @@ impl SceneRenderer {
             return Err(super::SceneError::NoRenderableObjects);
         }
 
+        // Keep the scene snapshot only if a post-process layer / reflection model
+        // samples `_rt_FullFrameBuffer`, or bloom is enabled; otherwise it is dead
+        // VRAM. The build above already bound it wherever needed, so dropping it
+        // when nothing references it is safe (frees 16–66 MB per plain scene).
+        let scene_snapshot = (bloom.is_some()
+            || items.iter().any(|it| match it {
+                SceneItem::Image(o) => o.reads_scene,
+                SceneItem::Model(m) => m.reads_scene,
+                _ => false,
+            }))
+        .then_some(scene_snapshot);
+
         let (blit_pipeline, blit_bind, blit_window) =
             build_blit(device, target.format, &scene_fbo, &fbo_sampler);
 
@@ -468,6 +485,7 @@ impl SceneRenderer {
             screen_mvp,
             items,
             sprite_scratch: Vec::new(),
+            pack_scratch: Vec::new(),
             text_pipeline,
             scene_fbo,
             scene_snapshot,
@@ -1128,7 +1146,9 @@ impl Renderer for SceneRenderer {
         // order set at build time *is* the cross-kind z-order (docs §5.7, §7).
         let scene_view = &self.scene_fbo.view;
         let scene_tex = &self.scene_fbo.texture;
-        let snap_tex = &self.scene_snapshot.texture;
+        // Present only when a layer reads the scene FBO / bloom is on; a
+        // `reads_scene` object always implies `Some` here (both set at build).
+        let snap_tex = self.scene_snapshot.as_ref().map(|s| &s.texture);
         let copy_extent = wgpu::Extent3d {
             width: self.proj_w,
             height: self.proj_h,
@@ -1139,6 +1159,9 @@ impl Renderer for SceneRenderer {
         // a layer is skipped when any ancestor group/image is hidden (docs §7.1).
         let parent_by_id = &self.parent_by_id;
         let visible_by_id = &self.visible_by_id;
+        // Reused UBO-pack buffer (disjoint field from `items` below), so no pass
+        // allocates its `_WEGlobals` bytes each frame (SPEC §V5).
+        let pack_scratch = &mut self.pack_scratch;
         for item in &mut self.items {
             match item {
                 // A script may have hidden this object this frame (V6: skip its
@@ -1151,7 +1174,7 @@ impl Renderer for SceneRenderer {
                     // the composite-so-far so the read never aliases the write
                     // (docs §11 shadow-copy; the copy sees every earlier object
                     // because encoder passes run in order).
-                    if object.reads_scene {
+                    if object.reads_scene && let Some(snap_tex) = snap_tex {
                         encoder.copy_texture_to_texture(
                             scene_tex.as_image_copy(),
                             snap_tex.as_image_copy(),
@@ -1169,6 +1192,7 @@ impl Renderer for SceneRenderer {
                         time,
                         texel,
                         audio,
+                        pack_scratch,
                     );
                 }
                 SceneItem::Particle(pg) => {
@@ -1192,7 +1216,7 @@ impl Renderer for SceneRenderer {
                     // REFLECTION meshes sample `_rt_FullFrameBuffer`: snapshot the
                     // composite-so-far first so the read never aliases the write
                     // (docs §6/§11 shadow-copy; `CModel::render` blits the scene).
-                    if mg.reads_scene {
+                    if mg.reads_scene && let Some(snap_tex) = snap_tex {
                         encoder.copy_texture_to_texture(
                             scene_tex.as_image_copy(),
                             snap_tex.as_image_copy(),
@@ -1220,6 +1244,7 @@ impl Renderer for SceneRenderer {
                             time,
                             texel,
                             audio,
+                            pack_scratch,
                         );
                     }
                 }
@@ -1227,9 +1252,10 @@ impl Renderer for SceneRenderer {
         }
 
         // Stage 1c: camera bloom — glow the composited scene in place (docs §5),
-        // so the blit below picks up the bloomed result unchanged.
-        if let Some(bloom) = &self.bloom {
-            bloom.run(&mut encoder, &self.scene_fbo, &self.scene_snapshot);
+        // so the blit below picks up the bloomed result unchanged. Bloom always
+        // keeps the snapshot alive (the gate at build includes `bloom.is_some()`).
+        if let (Some(bloom), Some(snap)) = (&self.bloom, &self.scene_snapshot) {
+            bloom.run(&mut encoder, &self.scene_fbo, snap);
         }
 
         // Stage 2: blit the scene FBO to the surface (docs §2.5).
@@ -1379,6 +1405,7 @@ fn apply_script_updates(items: &mut [SceneItem], updates: &[PropUpdate]) {
 /// Factored out of [`SceneRenderer::render`] so the item loop can borrow the
 /// object mutably while reading the renderer's other fields.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn draw_image_object(
     encoder: &mut wgpu::CommandEncoder,
     queue: &wgpu::Queue,
@@ -1390,6 +1417,7 @@ fn draw_image_object(
     time: f32,
     texel: [f32; 2],
     audio: Option<&AudioSpectrum>,
+    scratch: &mut Vec<u8>,
 ) {
     for pass in &object.passes {
         // Per-frame builtins for this pass.
@@ -1427,12 +1455,12 @@ fn draw_image_object(
             audio64: audio.map_or([0.0; 64], |a| a.audio64),
         };
         if let Some(ubo) = &pass.vs_ubo {
-            let bytes = pack_globals(&pass.vs_globals, &builtins, &pass.vs_params);
-            queue.write_buffer(ubo, 0, &bytes);
+            pack_globals(scratch, &pass.vs_globals, &builtins, &pass.vs_params);
+            queue.write_buffer(ubo, 0, scratch);
         }
         if let Some(ubo) = &pass.fs_ubo {
-            let bytes = pack_globals(&pass.fs_globals, &builtins, &pass.fs_params);
-            queue.write_buffer(ubo, 0, &bytes);
+            pack_globals(scratch, &pass.fs_globals, &builtins, &pass.fs_params);
+            queue.write_buffer(ubo, 0, scratch);
         }
 
         let (target_view, load) = match &pass.output {
