@@ -83,10 +83,16 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential clang cmake ninja-build nasm git curl ca-certificates \
-            pkg-config python3 \
+            build-essential clang ninja-build nasm git curl ca-certificates \
+            pkg-config python3 python3-pip \
             libasound2-dev libpulse-dev \
             libxcb1-dev libwayland-dev libxkbcommon-dev libx11-dev libdbus-1-dev
+          # debian:11 ships cmake 3.18, but shaderc's SPIRV-Tools needs >=3.22.1.
+          # Install a modern cmake from pip (pinned <4 so glslang/SPIRV-Tools'
+          # older cmake_minimum_required policies still apply). Keeps debian:11's
+          # old glibc (2.31) as the portability floor.
+          pip3 install "cmake<4"
+          cmake --version
       - name: Install Rust (rustup, current stable)
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
