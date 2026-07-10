@@ -75,6 +75,11 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     container: debian:11
+    # Container steps default to `sh` (dash); use bash so `set -o pipefail` and
+    # other bashisms work (bash ships in the debian:11 base image).
+    defaults:
+      run:
+        shell: bash
     steps:
       # Toolchain + build deps for the from-source static libs (nasm for ffmpeg;
       # cmake/ninja/git/python for shaderc) and the -dev packages for the libs
