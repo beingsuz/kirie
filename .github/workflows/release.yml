@@ -103,6 +103,15 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
+      # Cache ~/.cargo + target/ so only changed crates recompile. Critically this
+      # also caches the from-source ffmpeg + shaderc build outputs (in the
+      # ffmpeg-sys/shaderc-sys OUT_DIRs under target/), which are the ~10-minute
+      # part of a clean build. cache-on-failure keeps them even when a later step
+      # fails, so re-runs during iteration don't rebuild them.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: portable-debian11
+          cache-on-failure: true
       - name: Set crate version
         run: |
           v="${{ needs.prepare.outputs.version }}"; v="${v#v}"
