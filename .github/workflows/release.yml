@@ -151,6 +151,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      # This job only downloads artifacts (no checkout), so gh can't detect the
+      # repo from git — tell it explicitly.
+      GH_REPO: ${{ github.repository }}
       V: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
