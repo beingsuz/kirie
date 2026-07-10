@@ -1,0 +1,24 @@
+[package]
+name = "kirie-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kirie-platform = { path = "../kirie-platform" }
+ffmpeg-next = { workspace = true }
+crossbeam-channel = { workspace = true }
+cpal = { workspace = true }
+ringbuf = { workspace = true }
+triple_buffer = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

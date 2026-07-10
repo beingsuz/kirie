@@ -1,0 +1,56 @@
+[package]
+name = "kirie"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "kirie (切り絵) — Wallpaper Engine compatible wallpaper renderer for Linux"
+
+[features]
+# Default build compiles NEITHER web backend: `cargo build/test --workspace`
+# (no features) stays green on machines without libcef or webkit2gtk. The heavy
+# browser deps live behind these opt-in features, which pull the (otherwise
+# unbuilt) `kirie-web` crate and turn on the matching backend inside it.
+default = []
+# Chromium Embedded Framework off-screen-rendering backend. `kirie-web/cef`
+# downloads + links libcef. This is the backend that composites through kirie's
+# wgpu presentation layer (a `kirie_platform::Renderer` blitting CEF's OSR
+# frames), so it also powers `--screenshot`.
+web-cef = ["dep:kirie-web", "kirie-web/cef"]
+# wry + system webkit2gtk-4.1 native-surface backend. `kirie-web/webview` links
+# `webkit2gtk-4.1`/`libsoup-3.0` via pkg-config at COMPILE time, so this variant
+# only builds on a box with those -dev packages installed.
+web-webview = ["dep:kirie-web", "kirie-web/webview"]
+
+[dependencies]
+kirie-formats = { workspace = true }
+# Sibling workspace crates, not listed in [workspace.dependencies]; path deps
+# (root manifest is frozen — same convention kirie-render/kirie-video use).
+kirie-platform = { path = "../kirie-platform" }
+kirie-render = { path = "../kirie-render" }
+kirie-video = { path = "../kirie-video" }
+kirie-ipc = { path = "../kirie-ipc" }
+kirie-audio = { path = "../kirie-audio" }
+# Optional: only compiled when a `web-*` feature selects a backend. Keeping it
+# `optional` (rather than always-on) is what keeps the default build from
+# touching CEF/webkit2gtk (SPEC invariant: no-feature build stays lean + green).
+kirie-web = { path = "../kirie-web", optional = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+texture2ddecoder = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Safe SIGTERM/SIGINT handling (the crate's forbid(unsafe_code) rules out a
+# hand-rolled sigaction). Not a `[workspace.dependencies]` entry — the root
+# manifest is frozen, so a direct version dep, same convention as the sibling
+# path deps above. Pulls signal-hook-registry (already locked) + libc.
+signal-hook = "0.4"
+
+[lints]
+workspace = true

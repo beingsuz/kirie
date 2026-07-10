@@ -1,0 +1,30 @@
+[package]
+name = "kirie-bake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hash-keyed prebaked scene-bundle cache: rkyv archives, blake3 keys, mmap zero-copy load, background baker + LRU GC (SPEC.md §V7/§V8)"
+
+[dependencies]
+# Sibling workspace crates, not listed in [workspace.dependencies]; path deps
+# (root manifest is frozen — same convention kirie-render/kirie-video use).
+kirie-scene = { path = "../kirie-scene" }
+kirie-shader = { path = "../kirie-shader" }
+kirie-formats = { workspace = true }
+# spv-out: emit SPIR-V from a translated naga module so warm loads skip the
+# expensive glslang pass (features set in [workspace.dependencies]).
+naga = { workspace = true }
+
+rkyv = { workspace = true }
+blake3 = { workspace = true }
+memmap2 = { workspace = true }
+notify = { workspace = true }
+rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

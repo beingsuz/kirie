@@ -1,0 +1,47 @@
+[package]
+name = "kirie-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wallpaper renderers: still-image + animated-gif (.tex TEXS atlases) on wgpu, shared output-scaling math"
+
+[dependencies]
+kirie-formats = { workspace = true }
+# Sibling workspace crates, not listed in [workspace.dependencies]; path deps
+# (root manifest is frozen — reported in the task notes).
+kirie-platform = { path = "../kirie-platform" }
+kirie-scene = { path = "../kirie-scene" }
+kirie-shader = { path = "../kirie-shader" }
+kirie-audio = { path = "../kirie-audio" }
+kirie-script = { path = "../kirie-script" }
+# Scene image layers may carry an MP4 *video texture* (a `.tex` wrapping an MP4,
+# docs/format-tex.md §7.3). The scene renderer can't animate them yet, but it
+# decodes the FIRST frame here as a static still so the layer shows real content
+# instead of falling back to the 1×1 white (which paints the whole layer white).
+kirie-video = { path = "../kirie-video" }
+# `naga-ir` exposes `wgpu::ShaderSource::Naga` so kirie-shader's translated
+# naga modules load directly (not in wgpu's default feature set).
+wgpu = { workspace = true, features = ["naga-ir"] }
+naga = { workspace = true }
+# Text shaping + glyph rasterization for TEXT-layer objects (docs
+# render-architecture.md §7.4). Bundles fontdb (system-font discovery) and
+# swash (glyph raster); re-exported as `cosmic_text::fontdb`.
+cosmic-text = { workspace = true }
+image = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+# MPRIS media integration (SPEC §T24, docs/subsystems-misc.md §5): zbus session-bus
+# client publishes an immutable MediaState snapshot via arc-swap (V3/V4).
+arc-swap = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+pollster = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

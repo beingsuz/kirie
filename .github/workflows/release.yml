@@ -1,0 +1,119 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build three binaries from one source tree, selected by cargo feature:
+  #   - default      → `kirie`             (no web backend)
+  #   - web-cef      → `kirie-web-cef`     (Chromium Embedded Framework, OSR)
+  #   - web-webview  → `kirie-web-webview` (wry + system webkit2gtk-4.1)
+  # Each job installs only the deps its variant needs, so a failure in one
+  # backend never blocks the others (fail-fast: false).
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            features: ""
+            artifact: kirie
+          - variant: web-cef
+            features: web-cef
+            artifact: kirie-web-cef
+          - variant: web-webview
+            features: web-webview
+            artifact: kirie-web-webview
+    name: build (${{ matrix.variant }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}
+
+      # Base libraries every kirie build links (FFmpeg, ALSA/PulseAudio,
+      # shaderc, Wayland). cmake/ninja also cover the shaderc + CEF wrapper
+      # source builds.
+      - name: Install base system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev cmake ninja-build pkg-config curl \
+            libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
+            libavfilter-dev libswscale-dev libswresample-dev \
+            libasound2-dev libpulse-dev \
+            libwayland-dev libxkbcommon-dev \
+            libshaderc-dev glslang-dev
+
+      # web-webview: wry links webkit2gtk-4.1 + libsoup-3.0 + javascriptcoregtk-4.1
+      # + GTK3 via pkg-config at COMPILE time. This machine (and the CI default
+      # job) has none of them; installing the -dev package is what lets this
+      # variant link at all.
+      - name: Install webkit2gtk (web-webview only)
+        if: matrix.variant == 'web-webview'
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev
+
+      # The CEF binary distribution is downloaded + its libcef_dll_wrapper is
+      # cmake-built by the `cef-dll-sys` build script (the crate's documented
+      # bootstrap). No manual download step is required — only network + cmake,
+      # both present. cef-dll-sys caches the download under ~/.cache.
+
+      - name: Clippy (${{ matrix.variant }})
+        run: cargo clippy -p kirie ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --all-targets -- -D warnings
+
+      - name: Build release (${{ matrix.variant }})
+        run: cargo build --release -p kirie ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+
+      # The CEF subprocess helper is a separate binary that also links libcef; it
+      # only exists in a `cef` build (required-features).
+      - name: Build CEF helper (web-cef only)
+        if: matrix.variant == 'web-cef'
+        run: cargo build --release -p kirie-web --features cef --bin kirie-cef-helper
+
+      # Assemble the shippable tree. For CEF that means the binary + helper + the
+      # whole CEF runtime (libcef.so, icudtl.dat, *.pak, snapshot blobs, locales)
+      # that cef-dll-sys copied next to the built binary; the app finds them
+      # beside the executable at runtime (docs/subsystems-misc.md §3.2).
+      - name: Package artifact
+        id: package
+        run: |
+          set -euo pipefail
+          dist="dist/${{ matrix.artifact }}"
+          mkdir -p "$dist"
+          cp "target/release/kirie" "$dist/${{ matrix.artifact }}"
+          if [ "${{ matrix.variant }}" = "web-cef" ]; then
+            cp "target/release/kirie-cef-helper" "$dist/"
+            # CEF runtime files are copied beside the binary by the build script.
+            for f in libcef.so icudtl.dat chrome-sandbox v8_context_snapshot.bin snapshot_blob.bin; do
+              [ -f "target/release/$f" ] && cp "target/release/$f" "$dist/" || true
+            done
+            cp target/release/*.pak "$dist/" 2>/dev/null || true
+            cp target/release/*.bin "$dist/" 2>/dev/null || true
+            [ -d target/release/locales ] && cp -r target/release/locales "$dist/" || true
+          fi
+          tar -C dist -czf "${{ matrix.artifact }}-linux-x86_64.tar.gz" "${{ matrix.artifact }}"
+          echo "tarball=${{ matrix.artifact }}-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-linux-x86_64
+          path: ${{ steps.package.outputs.tarball }}
+          if-no-files-found: error
+
+      # On a tag push, attach the tarball to the GitHub Release.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.tarball }}

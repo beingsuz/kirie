@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+
+# Never commit extracted Wallpaper Engine content (copyrighted workshop assets).
+# These land at the repo root if `kirie extract` is run here.
+/effects/
+/materials/
+/models/
+/particles/
+/shaders/
+/sounds/
+/fixtures/
+/scene.json
+/project.json

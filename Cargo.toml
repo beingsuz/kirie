@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kirie",
+    "crates/kirie-formats",
+    "crates/kirie-scene",
+    "crates/kirie-bake",
+    "crates/kirie-render",
+    "crates/kirie-shader",
+    "crates/kirie-audio",
+    "crates/kirie-script",
+    "crates/kirie-video",
+    "crates/kirie-web",
+    "crates/kirie-platform",
+    "crates/kirie-ipc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/beingsuz/kirie"
+
+[workspace.dependencies]
+kirie-formats = { path = "crates/kirie-formats" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+lz4_flex = "0.11"
+flate2 = "1"
+clap = { version = "4", features = ["derive"] }
+blake3 = "1"
+memmap2 = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+texture2ddecoder = "0.1"
+insta = "1"
+wgpu = "30"
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+raw-window-handle = "0.6"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+crossbeam-channel = "0.5"
+arc-swap = "1"
+triple_buffer = "9"
+ringbuf = "0.5"
+rustfft = "6"
+cpal = "0.16"
+naga = { version = "30", features = ["glsl-in", "spv-in", "spv-out", "wgsl-out"] }
+shaderc = "0.10"
+rayon = "1"
+image-compare = "0.5"
+cef = "149"
+cef-dll-sys = "149"
+wry = "0.55"
+libpulse-binding = "2"
+rquickjs = "0.12"
+ffmpeg-next = "8"
+notify = "8"
+zbus = "5"
+x11rb = "0.13"
+cosmic-text = "0.19"
+rkyv = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+mime_guess = "2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

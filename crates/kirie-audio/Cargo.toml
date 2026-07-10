@@ -1,0 +1,21 @@
+[package]
+name = "kirie-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "System audio capture (PulseAudio monitor) + real-FFT spectrum bands for audio-reactive wallpapers"
+
+[dependencies]
+libpulse-binding = { workspace = true }
+ringbuf = { workspace = true }
+rustfft = { workspace = true }
+arc-swap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ringbuf = { workspace = true }
+
+[lints]
+workspace = true

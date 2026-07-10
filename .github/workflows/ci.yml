@@ -1,0 +1,43 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The DEFAULT (no-web-feature) build: fmt + clippy + tests. This is the build
+  # that must stay green on a machine without libcef or webkit2gtk, so no web
+  # feature is enabled here and neither browser backend is compiled (SPEC
+  # invariant). The web variants are exercised by release.yml.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # System libraries the (non-web) kirie workspace links: FFmpeg
+      # (kirie-video), ALSA + PulseAudio (kirie-audio/cpal), shaderc
+      # (kirie-shader), and Wayland (kirie-platform). clang/libclang is needed
+      # by the ffmpeg-sys bindgen step.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev cmake ninja-build pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
+            libavfilter-dev libswscale-dev libswresample-dev \
+            libasound2-dev libpulse-dev \
+            libwayland-dev libxkbcommon-dev \
+            libshaderc-dev glslang-dev
+
+      - run: cargo fmt --all --check
+      # Default build only: no web feature, so clippy runs the same lean crate
+      # graph the SPEC pins as the always-green baseline (SPEC §V12).
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

@@ -1,0 +1,34 @@
+[package]
+name = "kirie-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wayland presentation layer: layer-shell surfaces per output, wgpu integration, frame-callback driven render loop"
+
+[dependencies]
+smithay-client-toolkit = { workspace = true }
+wayland-client = { workspace = true }
+wgpu = { workspace = true }
+raw-window-handle = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# NOT in [workspace.dependencies] (reported in task blockers): the libwayland
+# system backend is required so that wl_display/wl_surface expose real C
+# pointers for wgpu's Vulkan VK_KHR_wayland_surface path. Same semver line as
+# the wayland-backend already resolved via wayland-client/sctk.
+wayland-backend = { workspace = true }
+# X11 root-window / desktop backend (docs/render-architecture.md §2.2). The
+# `xcb_ffi` feature backs the connection with libxcb so `get_raw_xcb_connection`
+# hands wgpu a real `xcb_connection_t*` for the Vulkan VK_KHR_xcb_surface path;
+# `allow-unsafe-code` is a prerequisite of `xcb_ffi`; `randr` provides the
+# per-CRTC monitor geometry the C++ X11 path reads (X11Output.cpp:111-159).
+x11rb = { workspace = true, features = ["allow-unsafe-code", "as-raw-xcb-connection", "randr"] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
