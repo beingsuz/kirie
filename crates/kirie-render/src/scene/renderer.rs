@@ -543,7 +543,16 @@ fn build_object(
     world: WorldXf,
 ) -> Option<ObjectGpu> {
     let visible = image.visible.value && object.base.visible.value;
-    let chain = plan::plan_image(image, visible);
+    // The `colorBlendMode` compatibility material, loaded at setup like the
+    // reference's `MaterialParser::load(project, "materials/util/
+    // effectpassthrough.json")` (`CImage.cpp:770-788`). A missing builtin
+    // degrades to no extra pass (SPEC.md §V9 skip-and-continue).
+    let color_blend = (image.color_blend_mode.value > 0)
+        .then(|| source.load(plan::COLOR_BLEND_MATERIAL))
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(|v| kirie_scene::material::Material::from_value(&v));
+    let chain = plan::plan_image(image, visible, color_blend.as_ref());
     if chain.passes.is_empty() {
         return None;
     }
