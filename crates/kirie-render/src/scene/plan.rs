@@ -799,7 +799,7 @@ mod tests {
             height: None,
             puppet: Some("models/女_puppet.mdl".into()),
         });
-        let plan = plan_image(&img, true);
+        let plan = plan_image(&img, true, None);
         assert_eq!(plan.passes[0].blending, Blending::Normal, "no puppet exception");
         assert_eq!(plan.passes[1].blending, Blending::Translucent, "relocated to last");
     }
