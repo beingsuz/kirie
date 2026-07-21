@@ -225,7 +225,6 @@ var __scene = {
   createLayer: function (arg) {
     var path = (typeof arg === 'string') ? arg : (arg && arg.file);
     if (!path) return undefined;
-    __host.ops.push({ op: 'createLayer', path: path, workshopId: __host.workshopId });
     // Return a REAL layer proxy backed by a synthetic script-world record, not
     // undefined: scripts chain property writes off the return value
     // (`var bar = thisScene.createLayer(...); bar.alignment = ...`) and an
@@ -238,8 +237,9 @@ var __scene = {
     __host.layers.push({
       id: id, name: String(path), parent: null,
       origin: [0, 0, 0], angles: [0, 0, 0], scale: [1, 1, 1],
-      visible: true, alpha: 1,
+      visible: true, alpha: 1, color: [1, 1, 1],
     });
+    __host.ops.push({ op: 'createLayer', id: id, path: path, workshopId: __host.workshopId });
     return __makeLayer(id);
   },
   sortLayer: function (layer, index) { if (layer && layer.__id !== undefined) __host.ops.push({ op: 'sortLayer', id: layer.__id, index: index }); },

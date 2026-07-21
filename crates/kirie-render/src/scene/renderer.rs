@@ -139,6 +139,33 @@ struct ObjectGpu {
     final_front: Option<usize>,
 }
 
+/// A script-created runtime layer (`thisScene.createLayer`, docs §6.2) — the
+/// audio-visualizer bar pattern: solid quads whose transform/color the script
+/// drives every frame. Rendered as flat translucent rects on top of the scene
+/// composite (model files are solid-pixel quads for this pattern; textured
+/// runtime layers are a tracked extension).
+struct RuntimeLayer {
+    origin: [f32; 3],
+    scale: [f32; 3],
+    angles: [f32; 3],
+    color: [f32; 3],
+    alpha: f32,
+    visible: bool,
+}
+
+impl Default for RuntimeLayer {
+    fn default() -> Self {
+        RuntimeLayer {
+            origin: [0.0; 3],
+            scale: [1.0; 3],
+            angles: [0.0; 3],
+            color: [1.0; 3],
+            alpha: 1.0,
+            visible: true,
+        }
+    }
+}
+
 /// One renderable scene object, in render order. Kinds composite into the same
 /// scene FBO so cross-kind z-ordering is just this vector's order (docs §5.7,
 /// §7.1-§7.4). Non-drawn kinds (light / shape / sound / group) never
@@ -180,6 +207,10 @@ pub struct SceneRenderer {
     pointer: [f32; 2],
     /// Previous frame's pointer (`g_PointerPositionLast`).
     pointer_last: [f32; 2],
+    /// Script-created runtime layers keyed by their synthetic (negative) id.
+    runtime_layers: std::collections::HashMap<i64, RuntimeLayer>,
+    /// Lazily built solid-quad pipeline + growable vertex buffer for them.
+    runtime_pipeline: Option<(wgpu::RenderPipeline, wgpu::Buffer, usize)>,
     /// Eased camera-parallax displacement (`CScene::m_parallaxDisplacement`):
     /// `mix(disp, (pointer-0.5)·amount·influence, clamp(delay·dt, 0, 1))`.
     parallax_disp: [f32; 2],
@@ -587,6 +618,8 @@ impl SceneRenderer {
             pointer: [0.5, 0.5],
             pointer_last: [0.5, 0.5],
             parallax_disp: [0.0, 0.0],
+            runtime_layers: std::collections::HashMap::new(),
+            runtime_pipeline: None,
             text_pipeline,
             scene_fbo,
             scene_snapshot,
@@ -1200,6 +1233,10 @@ impl Renderer for SceneRenderer {
         // output that gets no callbacks never ticks (V6 groundwork).
         if let Some(script) = &mut self.script {
             let updates = script.tick(dt, spectrum.as_deref(), self.pointer);
+            for (id, path) in script.take_created() {
+                tracing::debug!(id, %path, "runtime layer created by script");
+                self.runtime_layers.entry(id).or_default();
+            }
             if !updates.is_empty() {
                 // Keep the ancestor-visibility map live so a script hiding/showing
                 // a group also gates/ungates its descendants (docs §7.1).
@@ -1210,6 +1247,7 @@ impl Renderer for SceneRenderer {
                         self.visible_by_id.insert(u.object_id, *v);
                     }
                 }
+                apply_runtime_updates(&mut self.runtime_layers, &updates);
                 apply_script_updates(&mut self.items, &updates);
             }
         }
@@ -1466,6 +1504,81 @@ impl Renderer for SceneRenderer {
             }
         }
 
+        // Stage 1b2: script-created runtime layers (visualizer bars) — solid
+        // translucent quads on top of the composite, transforms in the same
+        // JSON→scene→NDC space as scene_quad_verts.
+        if self.runtime_layers.values().any(|l| l.visible && l.alpha > 0.0) {
+            let (sw, sh) = (self.proj_w as f32, self.proj_h as f32);
+            let mut verts: Vec<f32> = Vec::with_capacity(self.runtime_layers.len() * 36);
+            for l in self.runtime_layers.values() {
+                if !l.visible || l.alpha <= 0.0 {
+                    continue;
+                }
+                let cx = l.origin[0] - sw / 2.0;
+                let cy = l.origin[1] - sh / 2.0;
+                let (hw, hh) = (l.scale[0] / 2.0, l.scale[1] / 2.0);
+                let (sn, cs) = (-l.angles[2].to_radians()).sin_cos();
+                let corner = |dx: f32, dy: f32| {
+                    [
+                        (cx + dx * cs - dy * sn) / (sw / 2.0),
+                        (cy + dx * sn + dy * cs) / (sh / 2.0),
+                    ]
+                };
+                let tl = corner(-hw, hh);
+                let bl = corner(-hw, -hh);
+                let tr = corner(hw, hh);
+                let br = corner(hw, -hh);
+                let (r, g, b, a) = (l.color[0], l.color[1], l.color[2], l.alpha);
+                for v in [tl, bl, tr, tr, bl, br] {
+                    verts.extend_from_slice(&[v[0], v[1], r, g, b, a]);
+                }
+            }
+            if !verts.is_empty() {
+                let needed = verts.len() * 4;
+                let rebuild = match &self.runtime_pipeline {
+                    Some((_, _, cap)) => *cap < needed,
+                    None => true,
+                };
+                if rebuild {
+                    let pipeline = self
+                        .runtime_pipeline
+                        .take()
+                        .map(|(p, _, _)| p)
+                        .unwrap_or_else(|| build_runtime_pipeline(&self.device));
+                    let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("kirie-runtime-layer-verts"),
+                        size: (needed.max(4096)) as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    let cap = needed.max(4096);
+                    self.runtime_pipeline = Some((pipeline, buf, cap));
+                }
+                if let Some((pipeline, buf, _)) = &self.runtime_pipeline {
+                    self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&verts));
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("kirie-runtime-layers"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: scene_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    rp.set_pipeline(pipeline);
+                    rp.set_vertex_buffer(0, buf.slice(..));
+                    rp.draw(0..(verts.len() / 6) as u32, 0..1);
+                }
+            }
+        }
+
         // Stage 1c: camera bloom — glow the composited scene in place (docs §5),
         // so the blit below picks up the bloomed result unchanged. Bloom always
         // keeps the snapshot alive (the gate at build includes `bloom.is_some()`).
@@ -1567,7 +1680,12 @@ impl Renderer for SceneRenderer {
                 self.visible_by_id.insert(u.object_id, *v);
             }
         }
+        for (id, path) in self.script.as_mut().map(|s| s.take_created()).unwrap_or_default() {
+            tracing::debug!(id, %path, "runtime layer created by script");
+            self.runtime_layers.entry(id).or_default();
+        }
         if !updates.is_empty() {
+            apply_runtime_updates(&mut self.runtime_layers, &updates);
             apply_script_updates(&mut self.items, &updates);
         }
     }
@@ -1580,6 +1698,72 @@ impl Renderer for SceneRenderer {
 }
 
 // ---- helpers ---------------------------------------------------------------
+
+/// Solid translucent pipeline for runtime layers: NDC position + straight RGBA
+/// per vertex, standard alpha blend into the RGBA16F scene FBO.
+fn build_runtime_pipeline(device: &wgpu::Device) -> wgpu::RenderPipeline {
+    const SRC: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
+@vertex
+fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> VOut {
+    var o: VOut;
+    o.pos = vec4<f32>(pos, 0.0, 1.0);
+    o.color = color;
+    return o;
+}
+@fragment
+fn fs(i: VOut) -> @location(0) vec4<f32> { return i.color; }
+"#;
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("kirie-runtime-layer-shader"),
+        source: wgpu::ShaderSource::Wgsl(SRC.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("kirie-runtime-layer-layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("kirie-runtime-layer-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: 24,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 8,
+                        shader_location: 1,
+                    },
+                ],
+            })],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: super::fbo::FBO_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
 
 /// Apply a frame's SceneScript property updates to the live image objects
 /// (docs/scripting-api.md §5.1/§8). Only the fields flowing into per-object
@@ -1614,8 +1798,56 @@ fn apply_script_updates(items: &mut [SceneItem], updates: &[PropUpdate]) {
                         object.visible = *v;
                     }
                 }
-                PropTarget::Text => {}
+                // Text handled by the text pipeline; transforms only drive
+                // runtime layers (applied in `apply_runtime_updates`).
+                PropTarget::Text | PropTarget::Origin | PropTarget::Scale | PropTarget::Angles => {}
             }
+        }
+    }
+}
+
+/// Apply script updates addressed to runtime layers (synthetic ids from
+/// `createLayer`): transform, color, alpha and visibility all drive the solid
+/// quad drawn for the layer each frame.
+fn apply_runtime_updates(
+    layers: &mut std::collections::HashMap<i64, RuntimeLayer>,
+    updates: &[PropUpdate],
+) {
+    use super::scripting::as_vec3;
+    for u in updates {
+        let Some(l) = layers.get_mut(&u.object_id) else { continue };
+        match u.target {
+            PropTarget::Origin => {
+                if let Some(v) = as_vec3(&u.value) {
+                    l.origin = v;
+                }
+            }
+            PropTarget::Scale => {
+                if let Some(v) = as_vec3(&u.value) {
+                    l.scale = v;
+                }
+            }
+            PropTarget::Angles => {
+                if let Some(v) = as_vec3(&u.value) {
+                    l.angles = v;
+                }
+            }
+            PropTarget::Color => {
+                if let Some(c) = as_rgb(&u.value) {
+                    l.color = c;
+                }
+            }
+            PropTarget::Alpha => {
+                if let Some(a) = as_f32(&u.value) {
+                    l.alpha = a;
+                }
+            }
+            PropTarget::Visible => {
+                if let kirie_script::ScriptValue::Bool(v) = &u.value {
+                    l.visible = *v;
+                }
+            }
+            PropTarget::Brightness | PropTarget::Text => {}
         }
     }
 }

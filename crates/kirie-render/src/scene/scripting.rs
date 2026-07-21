@@ -47,6 +47,12 @@ pub enum PropTarget {
     Visible,
     /// Text object content.
     Text,
+    /// `origin` — layer translation (runtime layers; scene units, JSON space).
+    Origin,
+    /// `scale` — layer scale (runtime bar layers: pixel dims).
+    Scale,
+    /// `angles` — layer rotation, degrees.
+    Angles,
 }
 
 impl PropTarget {
@@ -58,6 +64,9 @@ impl PropTarget {
             "color" => Self::Color,
             "visible" => Self::Visible,
             "text" => Self::Text,
+            "origin" => Self::Origin,
+            "scale" => Self::Scale,
+            "angles" => Self::Angles,
             _ => return None,
         })
     }
@@ -103,6 +112,9 @@ pub struct ScriptHost {
     user_props: BTreeMap<String, ScriptValue>,
     res: [f32; 2],
     elapsed: f64,
+    /// Runtime layers created by scripts this session (`thisScene.createLayer`),
+    /// drained by the renderer via [`Self::take_created`]: (synthetic id, path).
+    created: Vec<(i64, String)>,
 }
 
 impl ScriptHost {
@@ -204,6 +216,7 @@ impl ScriptHost {
                 .collect(),
             res: [res.0 as f32, res.1 as f32],
             elapsed: 0.0,
+            created: Vec::new(),
         })
     }
 
@@ -267,6 +280,11 @@ impl ScriptHost {
         }
     }
 
+    /// Drain runtime layers scripts created since the last call: (id, path).
+    pub fn take_created(&mut self) -> Vec<(i64, String)> {
+        std::mem::take(&mut self.created)
+    }
+
     /// Turn a script [`TickOutput`] into the typed [`PropUpdate`]s to apply,
     /// updating the cached layer snapshot as it goes. Shared by [`Self::tick`] and
     /// [`Self::apply_user_property`].
@@ -299,8 +317,12 @@ impl ScriptHost {
                 });
             }
         }
-        // Imperative scene ops (docs §6.2/§8): only the leaf writes we drive.
+        // Imperative scene ops (docs §6.2/§8): leaf writes + runtime layers.
         for op in output.ops {
+            if let SceneOp::CreateLayer { layer_id, path, .. } = &op {
+                self.created.push((*layer_id, path.clone()));
+                continue;
+            }
             if let SceneOp::SetProperty {
                 layer_id,
                 name,
@@ -347,6 +369,21 @@ impl ScriptHost {
             PropTarget::Text => {
                 if let ScriptValue::Str(s) = value {
                     layer.text = Some(s.clone());
+                }
+            }
+            PropTarget::Origin => {
+                if let Some(v) = as_vec3(value) {
+                    layer.origin = Some(v);
+                }
+            }
+            PropTarget::Scale => {
+                if let Some(v) = as_vec3(value) {
+                    layer.scale = Some(v);
+                }
+            }
+            PropTarget::Angles => {
+                if let Some(v) = as_vec3(value) {
+                    layer.angles = Some(v);
                 }
             }
             // Brightness is not a registered `thisLayer` property (docs §4.1),
@@ -489,6 +526,14 @@ pub fn as_f32(v: &ScriptValue) -> Option<f32> {
 }
 
 /// Coerce a script value to an RGB triple (color).
+pub fn as_vec3(v: &ScriptValue) -> Option<[f32; 3]> {
+    match v {
+        ScriptValue::Vec3(a) => Some(*a),
+        ScriptValue::Float(f) => Some([*f as f32; 3]),
+        _ => None,
+    }
+}
+
 pub fn as_rgb(v: &ScriptValue) -> Option<[f32; 3]> {
     match v {
         ScriptValue::Vec3(c) => Some(*c),

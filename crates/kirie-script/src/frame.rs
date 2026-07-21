@@ -246,6 +246,8 @@ pub enum SceneOp {
     },
     /// `thisScene.createLayer(path|{file})` — instantiate a runtime image layer.
     CreateLayer {
+        /// The script-world synthetic layer id later `SetProperty` ops target.
+        layer_id: i64,
         /// Model path or asset file.
         path: String,
         /// Workshop id for relative-path resolution, if known.

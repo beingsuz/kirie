@@ -517,6 +517,7 @@ fn parse_op(v: &Value<'_>) -> Option<SceneOp> {
             fov: obj.get::<_, f64>("fov").ok().map(|f| f as f32),
         }),
         "createLayer" => Some(SceneOp::CreateLayer {
+            layer_id: obj.get::<_, f64>("id").ok()? as i64,
             path: obj.get("path").ok()?,
             workshop_id: obj.get::<_, Option<String>>("workshopId").ok().flatten(),
         }),
