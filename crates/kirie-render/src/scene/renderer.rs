@@ -125,6 +125,13 @@ struct ObjectGpu {
     /// The scene FBO is copied into the snapshot before this object draws so the
     /// sample reads the composite-so-far without aliasing the write (docs §11).
     reads_scene: bool,
+    /// Dependency donor (docs §5.6): draws its image-space composite into the
+    /// ping-pong FIRST each frame — even when invisible — and never to the
+    /// scene; dependents bind `_rt_imageLayerComposite_<id>_a/b` from it.
+    offscreen_donor: bool,
+    /// Ping-pong index holding the final composite after the full chain (the
+    /// view dependents bind). `None` when the object has no composite FBOs.
+    final_front: Option<usize>,
 }
 
 /// One renderable scene object, in render order. Kinds composite into the same
@@ -370,8 +377,68 @@ impl SceneRenderer {
         // The font stack is scanned once, the first time a drawable text object
         // is seen, and reused for the rest (system-font discovery is costly).
         let mut text_fonts: Option<TextFonts> = None;
+
+        // Dependency hoisting (docs §5.6): objects listed in another object's
+        // `dependencies` render their IMAGE-SPACE composite into their ping-pong
+        // FBOs even when invisible, and dependents bind it cross-object as
+        // `_rt_imageLayerComposite_<id>_a/b` (2155933185's hidden "planet N
+        // texture" donors). Donors build FIRST so dependents' bind groups can
+        // reference their composite views; they draw first each frame too.
+        let donor_ids: std::collections::HashSet<i64> = scene
+            .objects
+            .iter()
+            .flat_map(|o| o.base.dependencies.iter().copied())
+            .filter(|id| {
+                scene
+                    .objects
+                    .iter()
+                    .any(|o| o.base.id == *id && matches!(o.kind, ObjectKind::Image(_)))
+            })
+            .collect();
+        let mut donor_built: std::collections::HashMap<usize, ObjectGpu> =
+            std::collections::HashMap::new();
+        let mut cross: std::collections::HashMap<String, wgpu::TextureView> =
+            std::collections::HashMap::new();
         for &oi in &order {
             let object = &scene.objects[oi];
+            if !donor_ids.contains(&object.base.id) {
+                continue;
+            }
+            if let ObjectKind::Image(image) = &object.kind {
+                let world = world_xf(object.base.id, &local_xf);
+                if let Some(obj) = build_object(
+                    device,
+                    object,
+                    image,
+                    (proj_w, proj_h),
+                    &screen_mvp,
+                    source,
+                    &resolver,
+                    &mut registry,
+                    &fbo_sampler,
+                    &scene_snapshot,
+                    world,
+                    true,
+                    &cross,
+                ) {
+                    if let Some(front) = obj.final_front
+                        && let Some(fbo) = obj.fbos[front].as_ref()
+                    {
+                        let id = object.base.id;
+                        cross.insert(format!("_rt_imageLayerComposite_{id}_a"), fbo.view.clone());
+                        cross.insert(format!("_rt_imageLayerComposite_{id}_b"), fbo.view.clone());
+                    }
+                    donor_built.insert(oi, obj);
+                }
+            }
+        }
+
+        for &oi in &order {
+            let object = &scene.objects[oi];
+            if let Some(obj) = donor_built.remove(&oi) {
+                items.push(SceneItem::Image(Box::new(obj)));
+                continue;
+            }
             match &object.kind {
                 ObjectKind::Image(image) => {
                     let world = world_xf(object.base.id, &local_xf);
@@ -387,6 +454,8 @@ impl SceneRenderer {
                         &fbo_sampler,
                         &scene_snapshot,
                         world,
+                        false,
+                        &cross,
                     ) {
                         items.push(SceneItem::Image(Box::new(obj)));
                     }
@@ -576,6 +645,7 @@ impl SceneRenderer {
 /// Build one image object's GPU resources, or `None` if it plans nothing / has
 /// no buildable pass (SPEC.md §V9 skip-and-continue).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn build_object(
     device: &wgpu::Device,
     object: &Object,
@@ -588,8 +658,13 @@ fn build_object(
     fbo_sampler: &wgpu::Sampler,
     scene_snapshot: &Fbo,
     world: WorldXf,
+    offscreen_donor: bool,
+    cross: &std::collections::HashMap<String, wgpu::TextureView>,
 ) -> Option<ObjectGpu> {
-    let visible = image.visible.value && object.base.visible.value;
+    // A dependency donor plans its full chain even when invisible — hoisting
+    // renders its composite RT regardless of visibility (docs §5.6); only the
+    // scene draw is suppressed (donors never emit a Scene pass).
+    let visible = offscreen_donor || (image.visible.value && object.base.visible.value);
     let chain = plan::plan_image(image, visible);
     if chain.passes.is_empty() {
         return None;
@@ -739,7 +814,9 @@ fn build_object(
     // composite `_rt_imageLayerComposite_<id>_a/_b`; effect scratch passes render
     // elsewhere so the composite keeps the pre-effect image (§11.2).
     let n = built.len();
-    let fbos = if n > 1 {
+    // A dependency donor keeps its FULL chain in the ping-pong (its last pass
+    // composites instead of drawing to scene), so it always needs the pair.
+    let fbos = if n > 1 || offscreen_donor {
         [
             Some(Fbo::new(device, "kirie-image-fbo-a", iw, ih)),
             Some(Fbo::new(device, "kirie-image-fbo-b", iw, ih)),
@@ -790,7 +867,9 @@ fn build_object(
             binds,
             is_puppet_base,
         } = sv;
-        let is_scene = i == last_comp;
+        // A donor never draws to the scene: its final composite stays in the
+        // ping-pong (image space) for dependents to sample (docs §5.6).
+        let is_scene = i == last_comp && !offscreen_donor;
         let composite = is_composite(&target);
 
         // Effective texture slots: overlay the effect `bind`s onto the material's
@@ -909,6 +988,11 @@ fn build_object(
         };
         let mut named: std::collections::HashMap<&str, (&wgpu::TextureView, &wgpu::Sampler)> =
             std::collections::HashMap::new();
+        // Cross-object donor composites first (docs §5.6) — own names below win
+        // on any collision (a donor id can never equal this object's id).
+        for (name, view) in cross {
+            named.insert(name.as_str(), (view, fbo_sampler));
+        }
         named.insert("previous", (comp_view, fbo_sampler));
         named.insert(comp_a.as_str(), (comp_view, fbo_sampler));
         named.insert(comp_b.as_str(), (comp_view, fbo_sampler));
@@ -1036,6 +1120,8 @@ fn build_object(
         color: image.color.value,
         visible: true,
         reads_scene,
+        offscreen_donor,
+        final_front: comp_front,
     })
 }
 
@@ -1162,13 +1248,40 @@ impl Renderer for SceneRenderer {
         // Reused UBO-pack buffer (disjoint field from `items` below), so no pass
         // allocates its `_WEGlobals` bytes each frame (SPEC §V5).
         let pack_scratch = &mut self.pack_scratch;
+
+        // Sweep 0 — dependency donors (docs §5.6): render their image-space
+        // composites FIRST, unconditionally (they are invisible by design), so
+        // dependents sample this frame's content. Their passes only write their
+        // own ping-pong/scratch FBOs, never the scene.
+        for item in &mut self.items {
+            if let SceneItem::Image(object) = item
+                && object.offscreen_donor
+            {
+                draw_image_object(
+                    &mut encoder,
+                    &self.queue,
+                    object,
+                    scene_view,
+                    self.screen_mvp,
+                    self.ambient,
+                    self.skylight,
+                    time,
+                    texel,
+                    audio,
+                    pack_scratch,
+                );
+            }
+        }
+
         for item in &mut self.items {
             match item {
-                // A script may have hidden this object this frame (V6: skip its
-                // whole pass chain — zero GPU work). Also skip when any ancestor
-                // group/image is hidden (docs §7.1 ancestor gating).
+                // Donors drew in sweep 0; a script may have hidden this object
+                // this frame (V6: skip its whole pass chain — zero GPU work).
+                // Also skip when any ancestor group/image is hidden (§7.1).
                 SceneItem::Image(object)
-                    if !object.visible || !ancestors_visible(parent_by_id, visible_by_id, object.parent) => {}
+                    if object.offscreen_donor
+                        || !object.visible
+                        || !ancestors_visible(parent_by_id, visible_by_id, object.parent) => {}
                 SceneItem::Image(object) => {
                     // Post-process layers sample `_rt_FullFrameBuffer`: snapshot
                     // the composite-so-far so the read never aliases the write
