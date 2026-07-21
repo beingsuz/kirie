@@ -2277,10 +2277,12 @@ name = "kirie-render"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "blake3",
  "bytemuck",
  "cosmic-text",
  "image",
  "kirie-audio",
+ "kirie-bake",
  "kirie-formats",
  "kirie-platform",
  "kirie-scene",

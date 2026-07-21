@@ -20,6 +20,12 @@ kirie-scene = { path = "../kirie-scene" }
 kirie-shader = { path = "../kirie-shader" }
 kirie-audio = { path = "../kirie-audio" }
 kirie-script = { path = "../kirie-script" }
+# Phase 3.1: the content-addressed prebaked scene-bundle cache — the scene load
+# path consults it before parsing/resolving and bakes on a miss. kirie-bake owns
+# the (documented) mmap `unsafe`; this crate stays `#![forbid(unsafe_code)]`.
+kirie-bake = { path = "../kirie-bake" }
+# Digests for the bundle-source descriptor (pkg/project.json content hashes).
+blake3 = { workspace = true }
 # Scene image layers may carry an MP4 *video texture* (a `.tex` wrapping an MP4,
 # docs/format-tex.md §7.3). The scene renderer can't animate them yet, but it
 # decodes the FIRST frame here as a static still so the layer shows real content
