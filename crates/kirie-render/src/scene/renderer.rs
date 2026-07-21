@@ -129,6 +129,8 @@ struct ObjectGpu {
     /// ping-pong FIRST each frame — even when invisible — and never to the
     /// scene; dependents bind `_rt_imageLayerComposite_<id>_a/b` from it.
     offscreen_donor: bool,
+    // (video-backed textures live on SceneRenderer, not per object — one .tex
+    // may be shared by several layers.)
     /// Ping-pong index holding the final composite after the full chain (the
     /// view dependents bind). `None` when the object has no composite FBOs.
     final_front: Option<usize>,
@@ -165,6 +167,11 @@ pub struct SceneRenderer {
     /// Reused byte buffer for packing each pass's `_WEGlobals` block per frame
     /// (SPEC §V5: no per-frame allocation — capacity is retained across frames).
     pack_scratch: Vec<u8>,
+    /// Live video-backed `.tex` textures (docs §10): each keeps its decoder
+    /// playing; the newest ready frame streams into the bound GPU texture every
+    /// render tick (the reference plays these — a frozen first frame was the
+    /// 3445942378 divergence).
+    video_textures: Vec<super::texture::VideoTexture>,
     /// The shared text pipeline, built only when the scene has drawable text.
     text_pipeline: Option<TextPipeline>,
     scene_fbo: Fbo,
@@ -555,6 +562,7 @@ impl SceneRenderer {
             items,
             sprite_scratch: Vec::new(),
             pack_scratch: Vec::new(),
+            video_textures: registry.take_videos(),
             text_pipeline,
             scene_fbo,
             scene_snapshot,
@@ -1248,6 +1256,40 @@ impl Renderer for SceneRenderer {
         // Reused UBO-pack buffer (disjoint field from `items` below), so no pass
         // allocates its `_WEGlobals` bytes each frame (SPEC §V5).
         let pack_scratch = &mut self.pack_scratch;
+
+        // Stream video-backed `.tex` frames (docs §10): drain what the decoder
+        // has ready and upload only the NEWEST (no backlog), into the same
+        // texture object every pass bound. The decoder paces itself to the
+        // video clock and loops seamlessly; nothing ready ⇒ keep last frame.
+        for vt in &self.video_textures {
+            let mut newest = None;
+            while let Some(f) = vt.player.recv_frame_timeout(std::time::Duration::ZERO) {
+                newest = Some(f);
+            }
+            if let Some(f) = newest
+                && (f.width, f.height) == vt.size
+            {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &vt.gpu.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &f.data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * f.width),
+                        rows_per_image: Some(f.height),
+                    },
+                    wgpu::Extent3d {
+                        width: f.width,
+                        height: f.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
 
         // Sweep 0 — dependency donors (docs §5.6): render their image-space
         // composites FIRST, unconditionally (they are invisible by design), so

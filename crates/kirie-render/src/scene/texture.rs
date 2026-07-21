@@ -42,11 +42,27 @@ pub struct GpuTexture {
 
 /// A name-keyed cache of uploaded pass textures plus the fallback white texture
 /// (docs §6, §8.2). One registry per scene build.
+/// A live video-backed `.tex`: the decode thread keeps producing frames and the
+/// renderer streams the newest into `gpu.texture` each frame (the reference
+/// plays these; a frozen first frame was the 3445942378 divergence).
+pub struct VideoTexture {
+    /// The playing decoder (silent, wall-clock paced, seamless loop). Dropping
+    /// it stops the decode thread.
+    pub player: kirie_video::VideoPlayer,
+    /// The sampled texture every pass bound — updated in place.
+    pub gpu: std::sync::Arc<GpuTexture>,
+    /// Frame dimensions at allocation (upload guard).
+    pub size: (u32, u32),
+}
+
 pub struct TextureRegistry {
     device: wgpu::Device,
     queue: wgpu::Queue,
     cache: HashMap<String, Option<std::sync::Arc<GpuTexture>>>,
     white: std::sync::Arc<GpuTexture>,
+    /// Video-backed textures kept playing; the renderer takes these after build
+    /// ([`Self::take_videos`]) and streams frames per render tick.
+    videos: Vec<VideoTexture>,
 }
 
 impl TextureRegistry {
@@ -76,6 +92,7 @@ impl TextureRegistry {
             device: device.clone(),
             queue: queue.clone(),
             cache: HashMap::new(),
+            videos: Vec::new(),
             white,
         }
     }
@@ -168,7 +185,7 @@ impl TextureRegistry {
         Some(std::sync::Arc::new(gpu))
     }
 
-    fn load(&self, name: &str, source: &dyn AssetSource) -> Option<std::sync::Arc<GpuTexture>> {
+    fn load(&mut self, name: &str, source: &dyn AssetSource) -> Option<std::sync::Arc<GpuTexture>> {
         let path = format!("materials/{name}.tex");
         let bytes = source.load(&path)?;
         let content = match ImageContent::from_tex_bytes(&bytes) {
@@ -213,7 +230,7 @@ impl TextureRegistry {
     /// full-screen white sheet (the dominant cause of "all-white" scene
     /// renders in the corpus). Any failure returns `None` → white fallback, so
     /// this branch can never render worse than before.
-    fn load_video_first_frame(&self, name: &str, tex_bytes: &[u8]) -> Option<std::sync::Arc<GpuTexture>> {
+    fn load_video_first_frame(&mut self, name: &str, tex_bytes: &[u8]) -> Option<std::sync::Arc<GpuTexture>> {
         use std::time::Duration;
 
         let tex = kirie_formats::tex::Tex::parse(tex_bytes).ok()?;
@@ -235,18 +252,20 @@ impl TextureRegistry {
                 ..kirie_video::VideoOptions::default()
             },
         );
-        let frame = match opened {
+        let (player, frame) = match opened {
             Ok((player, _control)) => {
                 // The decode thread fills the bounded queue independently of the
-                // clock; frame 0 arrives promptly. Dropping `player` closes the
-                // frame receiver, so the decode thread exits (no leak).
-                player.recv_frame_timeout(Duration::from_secs(5))
+                // clock; frame 0 arrives promptly.
+                let frame = player.recv_frame_timeout(Duration::from_secs(5));
+                (Some(player), frame)
             }
             Err(e) => {
                 tracing::debug!(texture = %name, error = %e, "video texture open failed; using white");
-                None
+                (None, None)
             }
         };
+        // The decoder holds an open fd; unlinking the staged file is safe and
+        // keeps the temp dir clean even while playback continues.
         let _ = std::fs::remove_file(&file);
         let frame = frame?;
         if frame.width == 0 || frame.height == 0 {
@@ -256,7 +275,7 @@ impl TextureRegistry {
         // Frame pixels are top-row-first RGBA8 (kirie-video's converter), the
         // same layout `upload_rgba8` expects. A video frame is already at real
         // size, so no NPOT crop; honor the `.tex` sampler flags for wrap/filter.
-        let gpu = upload_rgba8(
+        let gpu = std::sync::Arc::new(upload_rgba8(
             &self.device,
             &self.queue,
             name,
@@ -265,8 +284,23 @@ impl TextureRegistry {
             &frame.data,
             tex.flags.no_interpolation(),
             tex.flags.clamp_uvs(),
-        );
-        Some(std::sync::Arc::new(gpu))
+        ));
+        // Keep the player: the renderer streams later frames into this same
+        // texture every tick (the reference PLAYS video .tex, docs §10).
+        if let Some(player) = player {
+            self.videos.push(VideoTexture {
+                player,
+                gpu: gpu.clone(),
+                size: (frame.width, frame.height),
+            });
+        }
+        Some(gpu)
+    }
+
+    /// Hand the live video textures to the renderer (called once after build;
+    /// the registry is discarded afterwards).
+    pub fn take_videos(&mut self) -> Vec<VideoTexture> {
+        std::mem::take(&mut self.videos)
     }
 }
 
