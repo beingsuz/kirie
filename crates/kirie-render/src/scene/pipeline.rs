@@ -150,10 +150,16 @@ pub fn build_pass(
         .iter()
         .any(|loc| !vs_out0.contains(loc));
     if mismatch {
-        let (vs_src, fs_src) = if has_array_varying(&vs_src) || has_array_varying(&fs_src) {
-            (vs_src.clone(), fs_src.clone())
+        // First drop fragment `varying` declarations the vertex never writes AND
+        // the fragment body never reads (declaration is the only occurrence).
+        // GL's linker eliminates such dead varyings (WE's stock waterripple.frag
+        // declares `varying vec2 v_Scroll;` and never uses it); wgpu links
+        // byte-strictly and would reject the whole pass below.
+        let fs_src_stripped = strip_dead_fs_varyings(&vs_src, &fs_src);
+        let (vs_src, fs_src) = if has_array_varying(&vs_src) || has_array_varying(&fs_src_stripped) {
+            (vs_src.clone(), fs_src_stripped)
         } else {
-            pin_varying_locations(&vs_src, &fs_src)
+            pin_varying_locations(&vs_src, &fs_src_stripped)
         };
         let vs0 = translate(Stage::Vertex, "pass.vert", &vs_src, resolver, &base_inputs)?;
         let fs0 = translate(Stage::Fragment, "pass.frag", &fs_src, resolver, &base_inputs)?;
@@ -585,6 +591,31 @@ fn pin_varying_locations(vs_src: &str, fs_src: &str) -> (String, String) {
         out
     };
     (rewrite(vs_src), rewrite(fs_src))
+}
+
+/// Drop fragment `varying` declarations that are dead: not declared by the
+/// vertex stage AND never mentioned again in the fragment source (the
+/// declaration line is the identifier's only occurrence). Mirrors the GL
+/// linker's dead-varying elimination so a stock shader with a stray declaration
+/// (waterripple.frag's `v_Scroll`) doesn't fail wgpu's strict VS/FS interface
+/// match and lose the whole pass. Conservative: an identifier that appears
+/// anywhere else (even a comment) is kept.
+fn strip_dead_fs_varyings(vs_src: &str, fs_src: &str) -> String {
+    let vs_names: BTreeSet<&str> = vs_src.lines().filter_map(varying_decl_name).collect();
+    let dead: Vec<&str> = fs_src
+        .lines()
+        .filter_map(varying_decl_name)
+        .filter(|n| !vs_names.contains(n))
+        .filter(|n| fs_src.matches(n).count() == 1)
+        .collect();
+    if dead.is_empty() {
+        return fs_src.to_string();
+    }
+    fs_src
+        .lines()
+        .filter(|line| !varying_decl_name(line).is_some_and(|n| dead.contains(&n)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether any line declares an *array* varying (`varying TYPE name[N];`).

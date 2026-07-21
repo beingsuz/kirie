@@ -216,7 +216,18 @@ impl CompiledEmitter {
                         *d = d.abs() * (s.signum() as f32);
                     }
                 }
-                let pos = math::add(base, math::mul(dir, radius));
+                // The reference masks the sampled offset per-axis by
+                // `directions` after the shell/annulus sample
+                // (CParticle.cpp:646 `randomPos *= emitter.directions`) — a
+                // directions like "1 0.03 0" confines spawns to a tight Y band.
+                // Without it, wide-radius emitters scatter across the whole
+                // ±distancemax sphere and most sprites land offscreen.
+                let offset = [
+                    dir[0] * radius * self.directions[0],
+                    dir[1] * radius * self.directions[1],
+                    dir[2] * radius * self.directions[2],
+                ];
+                let pos = math::add(base, offset);
                 let vel = math::mul(dir, rng.range(self.speedmin, self.speedmax));
                 (pos, vel)
             }

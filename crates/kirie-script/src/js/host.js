@@ -213,7 +213,26 @@ var __scene = {
   },
   // docs §6.2: the new layer is not visible in this frame's snapshot; return
   // undefined and let the integrator create it (deviation, documented).
-  createLayer: function (arg) { var path = (typeof arg === 'string') ? arg : (arg && arg.file); if (!path) return undefined; __host.ops.push({ op: 'createLayer', path: path, workshopId: __host.workshopId }); return undefined; },
+  createLayer: function (arg) {
+    var path = (typeof arg === 'string') ? arg : (arg && arg.file);
+    if (!path) return undefined;
+    __host.ops.push({ op: 'createLayer', path: path, workshopId: __host.workshopId });
+    // Return a REAL layer proxy backed by a synthetic script-world record, not
+    // undefined: scripts chain property writes off the return value
+    // (`var bar = thisScene.createLayer(...); bar.alignment = ...`) and an
+    // undefined return throws mid-init, aborting the rest of the script (e.g.
+    // the audio-visualizer template never gets its `thisLayer.visible=false`).
+    // The compositor does not draw synthetic layers yet (the createLayer op is
+    // recorded for it); the proxy keeps scripts running to completion.
+    if (__host.__nextSyntheticId === undefined) __host.__nextSyntheticId = -1000;
+    var id = __host.__nextSyntheticId--;
+    __host.layers.push({
+      id: id, name: String(path), parent: null,
+      origin: [0, 0, 0], angles: [0, 0, 0], scale: [1, 1, 1],
+      visible: true, alpha: 1,
+    });
+    return __makeLayer(id);
+  },
   sortLayer: function (layer, index) { if (layer && layer.__id !== undefined) __host.ops.push({ op: 'sortLayer', id: layer.__id, index: index }); },
 };
 ['bloom', 'bloomstrength', 'bloomthreshold', 'clearenabled', 'fov', 'nearz', 'farz', 'camerafade', 'camerashake', 'camerashakespeed', 'camerashakeamplitude', 'camerashakeroughness', 'cameraparallax', 'cameraparallaxamount', 'cameraparallaxdelay', 'cameraparallaxmouseinfluence'].forEach(function (k) {
