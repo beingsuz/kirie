@@ -170,6 +170,13 @@ pub trait WebBackend: Send {
     /// Mute or unmute the page's audio.
     fn set_muted(&mut self, muted: bool);
 
+    /// Deliver a user-properties batch to the page as a `__wpApplyProps({...})`
+    /// call (the shim forwards to `wallpaperPropertyListener.applyUserProperties`,
+    /// docs §3.5; reference `CWeb.cpp` sends the full set once on the first
+    /// frame, then singles on live changes). `json` is the `{name:{value:..}}`
+    /// object literal. Default: ignored (backends without script injection).
+    fn apply_properties(&mut self, _json: &str) {}
+
     /// Tear the browser down and stop its thread. Idempotent.
     fn shutdown(&mut self);
 }

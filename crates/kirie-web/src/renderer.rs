@@ -262,6 +262,22 @@ impl Renderer for WebRenderer {
         }
         self.queue.submit([encoder.finish()]);
     }
+
+    /// Live `setProperty` (doc §4.9): forward to the page as a one-entry
+    /// `applyUserProperties` batch. Values are typed like the reference's
+    /// encoder (`CWeb.cpp`): bools bare, numbers bare, everything else (colors
+    /// are "r g b" strings there too) as a JSON string.
+    fn set_property(&mut self, key: &str, value: &str) {
+        let typed = match value.trim() {
+            "true" => "true".to_owned(),
+            "false" => "false".to_owned(),
+            v if v.parse::<f64>().is_ok() => v.to_owned(),
+            v => format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
+        };
+        let name = key.replace('\\', "\\\\").replace('"', "\\\"");
+        let json = format!("{{\"{name}\":{{\"value\":{typed}}}}}");
+        self.backend.apply_properties(&json);
+    }
 }
 
 impl Drop for WebRenderer {

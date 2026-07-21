@@ -276,6 +276,8 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            #[cfg(feature = "web-cef")]
+            let props_web = props.clone();
             // Non-web (video/image/scene): build off the render thread and swap
             // (instant if it was preloaded).
             if let Some(build) = build_ctx.build_fn(screen.clone(), &path, props) {
@@ -297,7 +299,7 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
             // Only reachable in a `web-cef` build; otherwise falls through to
             // error (the daemon then shows a static preview).
             #[cfg(feature = "web-cef")]
-            if let Some(build_local) = build_ctx.build_local_fn(screen.clone(), &path) {
+            if let Some(build_local) = build_ctx.build_local_fn(screen.clone(), &path, props_web) {
                 let _ = cmd_tx.send(RenderCommand::SwapLocal {
                     screen: screen.clone(),
                     build_local,

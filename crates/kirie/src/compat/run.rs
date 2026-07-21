@@ -195,6 +195,9 @@ enum RunSpec {
     Web {
         /// `file://` (or `http(s)://`) URL of the wallpaper's entry page.
         url: String,
+        /// The wallpaper directory (its `project.json` declares the typed user
+        /// properties delivered to the page as `applyUserProperties`, doc §3.5).
+        dir: PathBuf,
     },
     /// Not runnable (unsupported type or a load error) — this output renders
     /// black; a note was already emitted at startup.
@@ -533,7 +536,10 @@ fn make_web_target(screen: String, bg: PathBuf, dir: &Path, file: &str) -> Targe
     Target {
         screen,
         bg,
-        spec: RunSpec::Web { url },
+        spec: RunSpec::Web {
+            url,
+            dir: dir.to_path_buf(),
+        },
         runnable: true,
     }
 }
@@ -635,8 +641,8 @@ fn build_renderer(
     // here. Everything else is `Send` and goes through `build_for_spec`, which
     // the preload / async-swap paths also call from a worker thread.
     #[cfg(feature = "web-cef")]
-    if let RunSpec::Web { url } = spec {
-        return build_web(target, url, silent);
+    if let RunSpec::Web { url, dir } = spec {
+        return build_web(target, url, dir, silent, properties);
     }
     build_for_spec(
         target,
@@ -657,7 +663,13 @@ fn build_renderer(
 /// initial-launch path ([`build_renderer`]) and the live-swap path
 /// ([`BuildContext::build_local_fn`]) so both build web identically.
 #[cfg(feature = "web-cef")]
-fn build_web(target: &RenderTarget<'_>, url: &str, silent: bool) -> Box<dyn Renderer> {
+fn build_web(
+    target: &RenderTarget<'_>,
+    url: &str,
+    dir: &Path,
+    silent: bool,
+    properties: &[(String, String)],
+) -> Box<dyn Renderer> {
     // Initial off-screen size is arbitrary: `WebRenderer` resizes the CEF surface
     // to the real output on its first frame. `--silent` mutes the page's audio
     // (docs/subsystems-misc.md §3: host mute).
@@ -670,6 +682,15 @@ fn build_web(target: &RenderTarget<'_>, url: &str, silent: bool) -> Box<dyn Rend
             if silent {
                 backend.set_muted(true);
             }
+            // Deliver the full typed property set once (project.json defaults
+            // with `--set-property` overrides folded in) — the reference sends
+            // this on the first frame and pages may block init on it
+            // (CWeb.cpp `__wpApplyProps`; the CEF thread queues it until the
+            // page's main frame exists).
+            let props = web_props_json(dir, properties);
+            if props != "{}" {
+                backend.apply_properties(&props);
+            }
             tracing::info!(output = %target.output_name, url, "web (CEF) wallpaper ready");
             Box::new(WebRenderer::new(target, Box::new(backend)))
         }
@@ -678,6 +699,62 @@ fn build_web(target: &RenderTarget<'_>, url: &str, silent: bool) -> Box<dyn Rend
             black(target)
         }
     }
+}
+
+/// The `{name:{value:..}}` JSON batch for a web wallpaper's `applyUserProperties`
+/// (doc §3.5), typed like the reference encoder (`CWeb.cpp`): bool bare, slider
+/// bare number, color an `"r g b"` float string, `text` UI labels skipped,
+/// everything else a JSON string. `--set-property` overrides replace the
+/// project defaults by declared type.
+#[cfg(feature = "web-cef")]
+fn web_props_json(dir: &Path, overrides: &[(String, String)]) -> String {
+    use kirie_formats::project::{Project, PropertyEntry, PropertyKind};
+    let Ok(project) = Project::from_path(dir.join("project.json")) else {
+        return "{}".to_owned();
+    };
+    let over: std::collections::HashMap<&str, &str> = overrides
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut out = String::from("{");
+    let mut first = true;
+    for (name, entry) in &project.general.properties {
+        let PropertyEntry::Property(p) = entry else { continue };
+        let raw = over.get(name.as_str()).copied();
+        let value = match &p.kind {
+            PropertyKind::Bool { value } => {
+                let v = raw.map_or(*value, |r| matches!(r.trim(), "1" | "true" | "True" | "TRUE"));
+                if v { "true".to_owned() } else { "false".to_owned() }
+            }
+            PropertyKind::Slider { value, .. } => {
+                let v = raw.and_then(|r| r.trim().parse::<f64>().ok()).unwrap_or(f64::from(*value));
+                format!("{v}")
+            }
+            PropertyKind::Color { value: [r, g, b] } => {
+                // Override form is "r g b" floats; keep the reference's string form.
+                let s = raw.map_or_else(|| format!("{r:.4} {g:.4} {b:.4}"), str::to_owned);
+                format!("\"{}\"", esc(&s))
+            }
+            // `text` entries are UI labels, not values (the reference skips them).
+            PropertyKind::Text => continue,
+            PropertyKind::Combo { value, .. }
+            | PropertyKind::TextInput { value }
+            | PropertyKind::UserShortcut { value }
+            | PropertyKind::File { value }
+            | PropertyKind::Directory { value }
+            | PropertyKind::SceneTexture { value } => {
+                format!("\"{}\"", esc(raw.unwrap_or(value)))
+            }
+        };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&format!("\"{}\":{{\"value\":{value}}}", esc(name)));
+    }
+    out.push('}');
+    out
 }
 
 /// Build a `Send` (non-web) renderer for `spec` + `screen_key`. Returns
@@ -860,6 +937,7 @@ impl BuildContext {
         self: &Arc<Self>,
         screen: String,
         path: &Path,
+        properties: Vec<(String, String)>,
     ) -> Option<kirie_platform::BuildLocalFn> {
         let target = make_target(
             screen,
@@ -867,7 +945,7 @@ impl BuildContext {
             self.scaling,
             self.clamp,
         );
-        let RunSpec::Web { url } = target.spec else {
+        let RunSpec::Web { url, dir } = target.spec else {
             return None;
         };
         let silent = self.silent;
@@ -878,7 +956,7 @@ impl BuildContext {
                 format,
                 output_name: name,
             };
-            build_web(&rt, &url, silent)
+            build_web(&rt, &url, &dir, silent, &properties)
         });
         Some(build)
     }

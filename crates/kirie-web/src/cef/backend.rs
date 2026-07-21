@@ -51,6 +51,9 @@ enum Command {
     Resize(i32, i32),
     Pointer(PointerState),
     Mute(bool),
+    /// Deliver a `__wpApplyProps` JSON batch to the page (queued until the
+    /// browser's main frame exists, then executed in order).
+    ApplyProps(String),
     Shutdown,
 }
 
@@ -179,6 +182,10 @@ impl WebBackend for CefBackend {
         self.send(Command::Mute(muted));
     }
 
+    fn apply_properties(&mut self, json: &str) {
+        self.send(Command::ApplyProps(json.to_owned()));
+    }
+
     fn shutdown(&mut self) {
         self.send(Command::Shutdown);
         self.cmd_tx = None;
@@ -262,6 +269,11 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
     }
 
     // --- Create the windowless browser (docs §3.5) ------------------------
+    // Keep a handle on the frame slot: property delivery is gated on the first
+    // published paint (the page has run its scripts and registered
+    // `wallpaperPropertyListener` by then — the reference delivers on the first
+    // rendered frame too, CWeb.cpp).
+    let paint_slot = slot.clone();
     let mut client = make_client(slot, size.clone());
     let window_info = WindowInfo::default().set_as_windowless(0);
     let browser_settings = BrowserSettings {
@@ -301,6 +313,11 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
     let mut last_right = false;
     let audio_zero = [0.0f32; 128];
 
+    // Property batches waiting for the page (reference CWeb.cpp delivers the
+    // full set on the first rendered frame — the page may block its init on
+    // applyUserProperties; later singles are live property changes).
+    let mut pending_props: Vec<String> = Vec::new();
+
     'pump: loop {
         let frame_start = Instant::now();
 
@@ -319,6 +336,7 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
                         host.set_audio_muted(i32::from(m));
                     }
                 }
+                Ok(Command::ApplyProps(json)) => pending_props.push(json),
                 Ok(Command::Shutdown) => break 'pump,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break 'pump,
@@ -350,6 +368,16 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
         if let Some(frame) = browser.main_frame() {
             let js = CefString::from(crate::shim::audio_call(&audio_zero).as_str());
             frame.execute_java_script(Some(&js), None, 0);
+            // Deliver queued property batches only after the first published
+            // paint: executing earlier races the page's own scripts — the shim
+            // finds no `wallpaperPropertyListener` yet and silently drops the
+            // batch (the reference also delivers on the first rendered frame).
+            if !pending_props.is_empty() && paint_slot.load_full().is_some() {
+                for json in pending_props.drain(..) {
+                    let call = CefString::from(crate::shim::apply_user_properties_call(&json).as_str());
+                    frame.execute_java_script(Some(&call), None, 0);
+                }
+            }
         }
 
         // Pump CEF once; OnPaint fires here on this thread.
