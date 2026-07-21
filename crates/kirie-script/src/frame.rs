@@ -16,7 +16,13 @@ use crate::value::ScriptValue;
 /// A scriptable layer's state (docs §4.1 registered properties). `None` fields
 /// are omitted so a script's `name in thisLayer` check matches the C++ (only
 /// the properties actually registered for that object type are present).
-#[derive(Clone, Debug, Default, Serialize)]
+///
+/// `Clone` is hand-written so `clone_from` reuses the `name`/`text` string
+/// heap: the integrator refreshes a retained [`HostFrame`]'s `layers` every
+/// tick via `Vec::clone_from` (which clones element-wise through
+/// `Clone::clone_from`), and the derived impl would re-allocate both strings
+/// per layer per frame.
+#[derive(Debug, Default, Serialize)]
 pub struct LayerState {
     /// Object id (`getLayerByID`, op targeting).
     pub id: i64,
@@ -52,6 +58,58 @@ pub struct LayerState {
     /// `text` (text objects).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+}
+
+impl Clone for LayerState {
+    fn clone(&self) -> Self {
+        LayerState {
+            id: self.id,
+            name: self.name.clone(),
+            parent: self.parent,
+            origin: self.origin,
+            scale: self.scale,
+            angles: self.angles,
+            color: self.color,
+            alpha: self.alpha,
+            visible: self.visible,
+            parallax_depth: self.parallax_depth,
+            point_size: self.point_size,
+            text: self.text.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        // Exhaustive destructure: adding a field without updating this copy is
+        // a compile error, so the reuse path can never silently drop state.
+        let LayerState {
+            id,
+            name,
+            parent,
+            origin,
+            scale,
+            angles,
+            color,
+            alpha,
+            visible,
+            parallax_depth,
+            point_size,
+            text,
+        } = source;
+        self.id = *id;
+        // `String::clone_from` (and `Option`'s Some→Some forwarding) reuse the
+        // existing capacity when it suffices — the whole point of this impl.
+        self.name.clone_from(name);
+        self.parent = *parent;
+        self.origin = *origin;
+        self.scale = *scale;
+        self.angles = *angles;
+        self.color = *color;
+        self.alpha = *alpha;
+        self.visible = *visible;
+        self.parallax_depth = *parallax_depth;
+        self.point_size = *point_size;
+        self.text.clone_from(text);
+    }
 }
 
 /// Camera transforms (docs §6.2 `getCameraTransforms`): the base pre-override

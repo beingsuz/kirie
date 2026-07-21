@@ -40,7 +40,7 @@ fn scripted_alpha_changes_over_ticks() {
     let mut last = -1.0_f32;
     let mut saw_update = false;
     for _ in 0..4 {
-        let updates = host.tick(0.5, None);
+        let updates = host.tick(0.5, None, [0.5, 0.5]);
         for u in updates {
             if u.object_id == 7 && u.target == PropTarget::Alpha {
                 let v = kirie_render::scene::scripting::as_f32(&u.value).expect("alpha is a scalar");
@@ -55,6 +55,51 @@ fn scripted_alpha_changes_over_ticks() {
         last > 0.5,
         "runtime-driven alpha advanced past the first frame: {last}"
     );
+}
+
+#[test]
+fn retained_frame_refreshes_user_props() {
+    // The host recycles one boxed `HostFrame` across ticks and only re-clones
+    // `engine.userProperties` into it when a live `setProperty` marked it dirty
+    // — this asserts a stale retained copy never survives the refresh, and
+    // that the refreshed copy persists on later (clean) ticks.
+    let json = r#"{
+        "camera": { "eye": "0 0 100", "center": "0 0 0", "up": "0 1 0" },
+        "general": { "orthogonalprojection": { "width": 64, "height": 64 } },
+        "objects": [
+            {
+                "id": 5,
+                "name": "layer",
+                "image": "models/x.json",
+                "alpha": {
+                    "value": 1.0,
+                    "script": "export function update(v) { return engine.userProperties.mode == 'on' ? 0.9 : 0.1; }"
+                }
+            }
+        ]
+    }"#;
+    let model = model(json);
+    let props = vec![(
+        "mode".to_owned(),
+        kirie_scene::PropertyValue::Combo("off".to_owned()),
+    )];
+    let mut host = ScriptHost::build(&model, (64, 64), &props).expect("scene has a driveable script");
+
+    let alpha = |updates: Vec<kirie_render::scene::scripting::PropUpdate>| {
+        updates
+            .into_iter()
+            .find(|u| u.object_id == 5 && u.target == PropTarget::Alpha)
+            .and_then(|u| kirie_render::scene::scripting::as_f32(&u.value))
+            .expect("alpha update present")
+    };
+
+    // Initial props ('off') through the fresh frame.
+    assert!((alpha(host.tick(0.016, None, [0.5, 0.5])) - 0.1).abs() < 1e-6);
+    // Live setProperty flips the combo; the recycled frame must see it.
+    host.apply_user_property("mode", &kirie_scene::PropertyValue::Combo("on".to_owned()));
+    assert!((alpha(host.tick(0.016, None, [0.5, 0.5])) - 0.9).abs() < 1e-6);
+    // And keep seeing it on later clean (non-dirty) ticks.
+    assert!((alpha(host.tick(0.016, None, [0.5, 0.5])) - 0.9).abs() < 1e-6);
 }
 
 #[test]
@@ -96,7 +141,7 @@ fn throwing_script_does_not_panic_and_leaves_value_alone() {
     let mut host = ScriptHost::build(&model, (64, 64), &[]).expect("script loads even if it throws at tick");
     // Several ticks, no panic; a throwing update yields no applied value.
     for _ in 0..3 {
-        let updates = host.tick(0.016, None);
+        let updates = host.tick(0.016, None, [0.5, 0.5]);
         assert!(
             updates.iter().all(|u| u.object_id != 3),
             "a throwing update must not apply a value"

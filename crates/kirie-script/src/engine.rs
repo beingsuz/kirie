@@ -40,7 +40,10 @@ enum Command {
     Tick {
         frame: Box<HostFrame>,
         overrides: Vec<(String, ScriptValue)>,
-        reply: Sender<TickOutput>,
+        /// The frame box rides back with the output so the integrator can
+        /// recycle its heap (audio/layers/user-props buffers) next tick
+        /// instead of re-allocating a fresh snapshot every frame.
+        reply: Sender<(TickOutput, Box<HostFrame>)>,
     },
     DispatchUserProperty {
         key: String,
@@ -148,9 +151,22 @@ impl ScriptEngine {
         frame: HostFrame,
         overrides: Vec<(String, ScriptValue)>,
     ) -> Result<TickOutput, ScriptError> {
+        self.tick_reuse(Box::new(frame), overrides).map(|(out, _)| out)
+    }
+
+    /// [`Self::tick`], but the frame box is handed back with the output. The
+    /// world only *reads* the frame (SPEC.md §V3), so a per-scene integrator
+    /// can keep one boxed frame alive, mutate it in place each tick and reuse
+    /// every contained allocation instead of cloning layers/audio/user-props
+    /// into a fresh snapshot every frame.
+    pub fn tick_reuse(
+        &self,
+        frame: Box<HostFrame>,
+        overrides: Vec<(String, ScriptValue)>,
+    ) -> Result<(TickOutput, Box<HostFrame>), ScriptError> {
         let (reply, rx) = bounded(1);
         self.send(Command::Tick {
-            frame: Box::new(frame),
+            frame,
             overrides,
             reply,
         })?;
@@ -262,7 +278,8 @@ fn serve(world: &mut World, cmd: Command) {
             overrides,
             reply,
         } => {
-            let _ = reply.send(world.tick(&frame, &overrides));
+            let out = world.tick(&frame, &overrides);
+            let _ = reply.send((out, frame));
         }
         Command::DispatchUserProperty { key, value, reply } => {
             let _ = reply.send(world.dispatch_user_property(&key, &value));

@@ -115,6 +115,18 @@ pub struct ScriptHost {
     /// Runtime layers created by scripts this session (`thisScene.createLayer`),
     /// drained by the renderer via [`Self::take_created`]: (synthetic id, path).
     created: Vec<(i64, String)>,
+    /// The retained [`HostFrame`] recycled across ticks: sent boxed to the
+    /// script thread and handed back with the output
+    /// ([`ScriptEngine::tick_reuse`]), so the audio band buffers, the layer
+    /// snapshot vector (and its per-layer strings) and the user-prop map are
+    /// reused in place instead of being re-allocated every frame. `None` only
+    /// before the first tick or after a failed round-trip (the box is lost with
+    /// the channel); the next tick rebuilds it from scratch.
+    frame: Option<Box<HostFrame>>,
+    /// True when [`Self::user_props`] changed since the retained frame last
+    /// copied it (a live `setProperty`) — the only time the per-tick refresh
+    /// must re-clone the map.
+    user_props_dirty: bool,
 }
 
 impl ScriptHost {
@@ -217,6 +229,8 @@ impl ScriptHost {
             res: [res.0 as f32, res.1 as f32],
             elapsed: 0.0,
             created: Vec::new(),
+            frame: None,
+            user_props_dirty: false,
         })
     }
 
@@ -229,27 +243,63 @@ impl ScriptHost {
     /// throwing script (§V9).
     pub fn tick(&mut self, dt: f32, audio: Option<&AudioSpectrum>, pointer: [f32; 2]) -> Vec<PropUpdate> {
         self.elapsed += f64::from(dt);
-        let frame = HostFrame {
-            runtime: self.elapsed,
-            frametime: f64::from(dt),
-            now: self.elapsed * 1000.0,
-            res_x: f64::from(self.res[0]),
-            res_y: f64::from(self.res[1]),
-            // Platform-fed pointer (T26), surface-normalized [0,1] top-left.
-            pointer_screen: pointer,
-            audio: audio.map(|s| AudioBuffers {
-                audio16: s.audio16.to_vec(),
-                audio32: s.audio32.to_vec(),
-                audio64: s.audio64.to_vec(),
-            }),
-            scene: self.scene.clone(),
-            layers: self.layers.clone(),
-            user_props: self.user_props.clone(),
-            ..HostFrame::default()
+        // Recycle the retained frame (the common case) instead of marshalling a
+        // fresh snapshot: only the parts that can actually change since last
+        // tick are rewritten, in place. First tick (or after a lost round-trip)
+        // builds it from scratch.
+        let mut frame = match self.frame.take() {
+            Some(f) => f,
+            None => {
+                let mut f = Box::new(HostFrame::default());
+                // Static for the scene's lifetime — set once, never refreshed.
+                f.scene = self.scene.clone();
+                f.user_props = self.user_props.clone();
+                self.user_props_dirty = false;
+                f
+            }
         };
+        frame.runtime = self.elapsed;
+        frame.frametime = f64::from(dt);
+        frame.now = self.elapsed * 1000.0;
+        frame.res_x = f64::from(self.res[0]);
+        frame.res_y = f64::from(self.res[1]);
+        // Platform-fed pointer (T26), surface-normalized [0,1] top-left.
+        frame.pointer_screen = pointer;
+        // Audio bands land in the retained buffers (clear + extend, no allocs
+        // once warm). Presence is stable per run, so the None arm's drop of the
+        // warm buffers is a one-off transition, not churn.
+        match (audio, &mut frame.audio) {
+            (Some(s), Some(bufs)) => {
+                bufs.audio16.clear();
+                bufs.audio16.extend_from_slice(&s.audio16);
+                bufs.audio32.clear();
+                bufs.audio32.extend_from_slice(&s.audio32);
+                bufs.audio64.clear();
+                bufs.audio64.extend_from_slice(&s.audio64);
+            }
+            (Some(s), slot @ None) => {
+                *slot = Some(AudioBuffers {
+                    audio16: s.audio16.to_vec(),
+                    audio32: s.audio32.to_vec(),
+                    audio64: s.audio64.to_vec(),
+                });
+            }
+            (None, slot) => *slot = None,
+        }
+        // Layers mutate between ticks (record_layer) — refresh via `clone_from`
+        // so the vector and each layer's strings keep their allocations.
+        frame.layers.clone_from(&self.layers);
+        // User props only change on a live `setProperty` (apply_user_property).
+        if self.user_props_dirty {
+            frame.user_props.clone_from(&self.user_props);
+            self.user_props_dirty = false;
+        }
 
-        let output = match self.engine.tick(frame, Vec::new()) {
-            Ok(o) => o,
+        let output = match self.engine.tick_reuse(frame, Vec::new()) {
+            Ok((o, frame)) => {
+                self.frame = Some(frame);
+                o
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "script tick failed; leaving properties unchanged");
                 return Vec::new();
@@ -271,6 +321,9 @@ impl ScriptHost {
     ) -> Vec<PropUpdate> {
         let sv = prop_to_script(value);
         self.user_props.insert(key.to_owned(), sv.clone());
+        // The retained frame's copy of `engine.userProperties` is now stale;
+        // the next tick re-clones it (and only then — see `user_props_dirty`).
+        self.user_props_dirty = true;
         match self.engine.dispatch_user_property(key.to_owned(), sv) {
             Ok(output) => self.process_output(output),
             Err(e) => {

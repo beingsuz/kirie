@@ -99,9 +99,16 @@ struct PassGpu {
     /// constants are re-resolved and `{vs,fs}_params` recomputed, so the next
     /// frame's `_WEGlobals` pack (which reads `{vs,fs}_params`) shows the new
     /// value — no rebuild.
+    ///
+    /// `material_pass` stays per-pass (it is mutated in place by
+    /// [`SceneRenderer::set_property`]), trimmed to the `constantshadervalues`
+    /// entries some reflection parameter actually reads. The reflection itself
+    /// is immutable after build, so it is `Arc`-shared across every pass built
+    /// from the same shader (shaders are heavily reused across objects) instead
+    /// of retaining one deep copy per pass.
     material_pass: kirie_scene::material::Pass,
-    params_vs: Vec<kirie_shader::reflect::Parameter>,
-    params_fs: Vec<kirie_shader::reflect::Parameter>,
+    params_vs: Arc<Vec<Parameter>>,
+    params_fs: Arc<Vec<Parameter>>,
 }
 
 /// One renderable image object with its FBOs and passes.
@@ -458,6 +465,9 @@ impl SceneRenderer {
             std::collections::HashMap::new();
         let mut cross: std::collections::HashMap<String, wgpu::TextureView> =
             std::collections::HashMap::new();
+        // Build-scoped reflection interning (dropped with `new`; the shared
+        // tables live on inside the passes that reference them).
+        let mut param_cache = ParamCache::new();
         for &oi in &order {
             let object = &scene.objects[oi];
             if !donor_ids.contains(&object.base.id) {
@@ -479,6 +489,7 @@ impl SceneRenderer {
                     world,
                     true,
                     &cross,
+                    &mut param_cache,
                 ) {
                     if let Some(front) = obj.final_front
                         && let Some(fbo) = obj.fbos[front].as_ref()
@@ -515,6 +526,7 @@ impl SceneRenderer {
                         world,
                         false,
                         &cross,
+                        &mut param_cache,
                     ) {
                         items.push(SceneItem::Image(Box::new(obj)));
                     }
@@ -707,9 +719,36 @@ impl SceneRenderer {
     }
 }
 
+/// Scene-build interning table for shader-parameter reflection: shader name →
+/// the distinct `(vs, fs)` parameter tables seen under that name. Shaders are
+/// heavily reused across objects (every image base pass is `genericimage2`,
+/// effect shaders repeat per instance), so interning collapses the per-pass
+/// retained reflection ([`PassGpu::params_vs`]/`params_fs`) to one allocation
+/// per distinct table. Keyed by name only as an index — reuse is decided by
+/// comparing the tables themselves, so combo-divergent variants of one shader
+/// never alias and correctness never rests on the key.
+type ParamCache = HashMap<String, Vec<(Arc<Vec<Parameter>>, Arc<Vec<Parameter>>)>>;
+
+/// Intern one pass's reflection tables through the [`ParamCache`]: return the
+/// shared copy when an identical `(vs, fs)` pair was already seen for this
+/// shader, else store and share this one.
+fn intern_params(
+    cache: &mut ParamCache,
+    shader: &str,
+    vs: Vec<Parameter>,
+    fs: Vec<Parameter>,
+) -> (Arc<Vec<Parameter>>, Arc<Vec<Parameter>>) {
+    let variants = cache.entry(shader.to_owned()).or_default();
+    if let Some((v, f)) = variants.iter().find(|(v, f)| **v == vs && **f == fs) {
+        return (Arc::clone(v), Arc::clone(f));
+    }
+    let entry = (Arc::new(vs), Arc::new(fs));
+    variants.push(entry.clone());
+    entry
+}
+
 /// Build one image object's GPU resources, or `None` if it plans nothing / has
 /// no buildable pass (SPEC.md §V9 skip-and-continue).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn build_object(
     device: &wgpu::Device,
@@ -725,6 +764,7 @@ fn build_object(
     world: WorldXf,
     offscreen_donor: bool,
     cross: &std::collections::HashMap<String, wgpu::TextureView>,
+    param_cache: &mut ParamCache,
 ) -> Option<ObjectGpu> {
     // A dependency donor plans its full chain even when invisible — hoisting
     // renders its composite RT regardless of visibility (docs §5.6); only the
@@ -818,6 +858,11 @@ fn build_object(
     struct Survivor {
         built: BuiltPass,
         raw: kirie_scene::material::Pass,
+        /// The pass's shader-parameter reflection, taken out of [`BuiltPass`]
+        /// and interned through the scene-build [`ParamCache`] so identical
+        /// tables (same shader, same combos) are one shared allocation.
+        params_vs: Arc<Vec<Parameter>>,
+        params_fs: Arc<Vec<Parameter>>,
         target: Option<String>,
         binds: Vec<(u32, String)>,
         /// True for the base (first) material pass of a puppet object — the pass
@@ -858,13 +903,33 @@ fn build_object(
             &fs_src,
             resolver,
         ) {
-            Ok(b) => built.push(Survivor {
-                built: b,
-                raw: plan_pass.pass.clone(),
-                target: plan_pass.target.clone(),
-                binds: plan_pass.binds.clone(),
-                is_puppet_base,
-            }),
+            Ok(mut b) => {
+                let (params_vs, params_fs) = intern_params(
+                    param_cache,
+                    &plan_pass.shader,
+                    std::mem::take(&mut b.vs_params),
+                    std::mem::take(&mut b.fs_params),
+                );
+                // Retain only the constants some reflection parameter reads:
+                // the retained copy exists solely for `set_property`'s
+                // `resolve_constants` + `resolve_params` re-resolution, and
+                // `resolve_params` looks up `constantshadervalues` by each
+                // parameter's `material` key — entries no parameter names are
+                // never read again (the full authored pass already resolved
+                // the initial `{vs,fs}_params` below and stays in the model).
+                let mut raw = plan_pass.pass.clone();
+                raw.constantshadervalues
+                    .retain(|k, _| params_vs.iter().chain(params_fs.iter()).any(|p| p.material == *k));
+                built.push(Survivor {
+                    built: b,
+                    raw,
+                    params_vs,
+                    params_fs,
+                    target: plan_pass.target.clone(),
+                    binds: plan_pass.binds.clone(),
+                    is_puppet_base,
+                });
+            }
             Err(e) => {
                 tracing::debug!(shader = %plan_pass.shader, error = %e, "pass shader failed to build; skipped");
             }
@@ -928,6 +993,8 @@ fn build_object(
         let Survivor {
             built: built_pass,
             raw: raw_pass,
+            params_vs,
+            params_fs,
             target,
             binds,
             is_puppet_base,
@@ -1025,8 +1092,8 @@ fn build_object(
             .filter(|_| puppet_indices.is_some())
             .map_or(0, |m| m.indices.len() as u32);
 
-        let vs_params = resolve_params(&built_pass.vs_params, &raw_pass);
-        let fs_params = resolve_params(&built_pass.fs_params, &raw_pass);
+        let vs_params = resolve_params(&params_vs, &raw_pass);
+        let fs_params = resolve_params(&params_fs, &raw_pass);
 
         // The pass input (slot-0 default and `previous`): the scene snapshot when
         // the first pass samples `_rt_FullFrameBuffer`, else the layer texture
@@ -1145,8 +1212,6 @@ fn build_object(
             pipeline,
             vs_globals,
             fs_globals,
-            vs_params: params_vs,
-            fs_params: params_fs,
             ..
         } = built_pass;
 
