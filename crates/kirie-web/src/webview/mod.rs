@@ -1,20 +1,40 @@
 //! The `webview` web-wallpaper backend: wry + the system `webkit2gtk-4.1`.
 //!
-//! # Rendering model — native surface, not off-screen
+//! # Status: native-surface fallback only — off-screen is won't-fix (upstream)
 //!
 //! The CEF backend ([`crate::cef`]) renders **off-screen**: Chromium paints
 //! into a CPU pixel buffer that kirie uploads to a wgpu texture and composites
 //! like any other wallpaper (the [`crate::backend::WebBackend`] trait is shaped
 //! around that — `new(url, size)` + `latest_frame()`).
 //!
-//! wry cannot do that. On Linux wry is a thin wrapper over `webkit2gtk`, which
-//! renders with its **own** GTK/EGL context straight into a native window and
-//! exposes **no** CPU pixel read-back (there is no OSR path, and no synchronous
-//! snapshot API on wry 0.55). A `wry::WebView` is also `!Send` — it must be
-//! created and used on the GTK main thread. Both facts make it impossible to
-//! implement the off-screen, `Send`, frame-publishing `WebBackend` trait.
+//! wry cannot do that, and this is an upstream limitation of wry/webkit2gtk on
+//! Linux — not pending kirie work. Evidence, from the vendored wry 0.55.1
+//! source (`~/.cargo/registry/src/…/wry-0.55.1/`):
 //!
-//! So this backend uses the only model webkit2gtk supports for a full-surface
+//! * `src/webkitgtk/mod.rs` — the complete Linux `WebView` API surface is
+//!   `eval`, `load_url(_with_headers)`, `load_html`, `reload`, `bounds` /
+//!   `set_bounds`, `set_visible`, `focus`, `zoom`, `print`, devtools, cookies,
+//!   `clear_all_browsing_data`. **No** snapshot, paint-callback, or pixel
+//!   read-back API of any kind; rendering goes straight to the GTK widget via
+//!   webkit's own GL context.
+//! * `src/lib.rs` (`WebViewExtUnix::webview`) hands out the underlying
+//!   `webkit2gtk::WebView`, and the `webkit2gtk` crate (2.0.2,
+//!   `src/auto/web_view.rs`) does expose `WebViewExt::snapshot` —
+//!   `webkit_web_view_get_snapshot`. That is an **asynchronous, GTK-main-loop
+//!   -bound screenshot** call (WebKit re-renders the page into a fresh
+//!   `cairo::Surface` per invocation): unusable as a 60 fps per-frame OSR
+//!   feed, still `!Send`, and still requiring a realized native window.
+//! * True off-screen WebKit on Linux is **WPE WebKit** (`wpewebkit`), a
+//!   different engine build that wry does not wrap.
+//!
+//! Implementing the off-screen, `Send`, frame-publishing `WebBackend` trait on
+//! top of this API is therefore impossible; the aspiration to make the
+//! `webview` feature composite through the wgpu presentation layer is closed
+//! as **won't-fix**. Use the `cef` feature for that.
+//!
+//! # Rendering model — native surface
+//!
+//! This backend uses the only model webkit2gtk supports for a full-surface
 //! HTML wallpaper: **it fills the background window directly.** The host
 //! (kirie-platform) creates the background surface — on Wayland a layer-shell
 //! surface (a GTK window promoted to the background layer via `gtk-layer-shell`),

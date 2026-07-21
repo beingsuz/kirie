@@ -95,6 +95,16 @@ impl WebviewBackend {
         muted: bool,
     ) -> Result<Self, WebError> {
         let size = size.clamped();
+        // Make the model unmistakable at runtime: this backend paints its own
+        // native surface and can never composite through the wgpu presentation
+        // layer (wry/webkit2gtk has no off-screen path — see the module docs;
+        // won't-fix upstream). The CEF backend is the composited one.
+        tracing::warn!(
+            url,
+            "webview (wry/webkit2gtk) backend: native-surface fallback only; it cannot \
+             render off-screen (upstream wry/webkit2gtk limitation) — build with the \
+             `cef` feature (kirie: --features web-cef) for composited web wallpapers"
+        );
         let webview = build_webview(url, surface, muted)?;
         let backend = Self {
             webview: Some(webview),

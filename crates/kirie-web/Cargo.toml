@@ -17,7 +17,10 @@ default = []
 # `cef-dll-sys` are HEAVY (download + cmake-build of libcef); gated so the
 # default build never touches them.
 cef = ["dep:cef", "dep:cef-dll-sys"]
-# wry + system webkit2gtk-4.1 native-surface backend. `wry` links
+# wry + system webkit2gtk-4.1 native-surface backend. NOTE: this is a
+# native-surface fallback only — wry/webkit2gtk has no off-screen rendering
+# path (upstream limitation, won't-fix; see src/webview/mod.rs), so it can
+# never implement the composited `WebBackend` trait; prefer `cef`. `wry` links
 # `webkit2gtk-4.1`/`libsoup-3.0` via pkg-config at COMPILE time, so this
 # feature only builds on a box with those -dev packages; gated so the default
 # build never needs them.
