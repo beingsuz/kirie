@@ -218,6 +218,10 @@ pub struct Builtins {
     pub texel_size: [f32; 2],
     /// `g_ModelViewProjectionMatrix` (and aliases) — pass MVP.
     pub mvp: Mat4,
+    /// Override for `g_ModelViewProjectionMatrixInverse` (effect passes: the
+    /// NDC→image-pixel mapping the reference's ortho inverse provides). `None`
+    /// ⇒ `inverse(mvp)`.
+    pub mvp_inverse: Option<Mat4>,
     /// `g_ModelMatrix` (and alias) — object/ortho model matrix.
     pub model: Mat4,
     /// `g_ViewProjectionMatrix` — identity for images, camera VP for 3D.
@@ -256,6 +260,7 @@ impl Default for Builtins {
             pointer_last: [0.5, 0.5],
             texel_size: [0.0, 0.0],
             mvp: IDENTITY,
+            mvp_inverse: None,
             model: IDENTITY,
             view_projection: IDENTITY,
             eye: [0.0, 0.0, 1000.0],
@@ -311,7 +316,16 @@ impl Builtins {
             "g_Texture0Translation" => set(buf, &self.texture0_translation),
             "g_Texture0Rotation" => set(buf, &self.texture0_rotation),
             "g_ModelViewProjectionMatrix" | "g_EffectModelViewProjectionMatrix" => set(buf, &self.mvp),
-            "g_ModelViewProjectionMatrixInverse" => set(buf, &super::matrix::inverse(&self.mvp)),
+            // Effect passes draw a pre-baked NDC quad with an identity MVP, but
+            // shaders unprojecting the pointer (xray's `mul(pointerNDC, MVPInv)`
+            // then `× 1/g_Texture0Resolution`) need the REAL inverse — the
+            // reference renders effect quads under an image-space ortho, whose
+            // inverse maps NDC → image pixels. `mvp_inverse` carries that
+            // override; `None` = plain inverse of `mvp` (scene passes).
+            "g_ModelViewProjectionMatrixInverse" => match self.mvp_inverse {
+                Some(m) => set(buf, &m),
+                None => set(buf, &super::matrix::inverse(&self.mvp)),
+            },
             "g_ModelMatrix" | "g_EffectModelMatrix" => set(buf, &self.model),
             "g_ModelMatrixInverse" => set(buf, &super::matrix::inverse(&self.model)),
             "g_ViewProjectionMatrix" => set(buf, &self.view_projection),

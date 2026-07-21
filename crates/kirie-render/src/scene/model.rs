@@ -420,6 +420,7 @@ pub(super) fn draw_model(
             pointer_last: [0.5, 0.5],
             texel_size: texel,
             mvp,
+            mvp_inverse: None,
             model: model_matrix,
             view_projection,
             eye: camera.eye,

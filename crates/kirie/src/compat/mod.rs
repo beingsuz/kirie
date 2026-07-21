@@ -93,8 +93,13 @@ fn print_banner(args: &args::CompatArgs) {
 fn init_tracing() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // Respect `RUST_LOG` (the hardcoded INFO cap silently swallowed every
+        // debug/trace diagnostic); default stays INFO when unset.
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
             .with_writer(std::io::stderr)
             .try_init();
     });

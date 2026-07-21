@@ -1141,6 +1141,11 @@ fn build_object(
         });
     }
     let _ = screen_mvp; // screen MVP applied per-frame via builtins.
+    tracing::trace!(target: "kirie_render::ptrdbg",
+        id = object.base.id,
+        n_passes = passes.len(),
+        geoms = ?passes.iter().map(|p| format!("{:?}", p.geometry)).collect::<Vec<_>>(),
+        "object built");
     Some(ObjectGpu {
         id: object.base.id,
         parent: object.base.parent,
@@ -1658,6 +1663,29 @@ fn draw_image_object(
             Geometry::PuppetCopy => pass.model_matrix,
             Geometry::Copy | Geometry::Pass => matrix::IDENTITY,
         };
+        // Effect quads are pre-baked NDC (identity MVP), but a shader
+        // unprojecting the pointer (xray: `mul(ndc, MVPInverse)` then
+        // `× 1/g_Texture0Resolution`) needs the reference's image-space ortho
+        // inverse: NDC → image pixels of the pass's tex0.
+        let mvp_inverse = match pass.geometry {
+            Geometry::Copy | Geometry::Pass => {
+                let (tw, th) = (pass.tex_resolution[0][0], pass.tex_resolution[0][1]);
+                tracing::trace!(target: "kirie_render::ptrdbg",
+                    object = object.id, tw, th,
+                    px = pointer[0], py = pointer[1],
+                    vs_members = ?pass.vs_globals.members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                    "effect pass builtins");
+                (tw > 0.0 && th > 0.0).then(|| {
+                    let mut m = matrix::IDENTITY;
+                    m[0] = tw / 2.0; // x: (ndc+1)·w/2
+                    m[5] = th / 2.0; // y: (ndc+1)·h/2 (top-left UV space)
+                    m[12] = tw / 2.0;
+                    m[13] = th / 2.0;
+                    m
+                })
+            }
+            _ => None,
+        };
         let builtins = Builtins {
             time,
             daytime: 0.0,
@@ -1670,6 +1698,7 @@ fn draw_image_object(
             pointer_last,
             texel_size: texel,
             mvp,
+            mvp_inverse,
             model: pass.model_matrix,
             view_projection: matrix::IDENTITY,
             eye: [0.0, 0.0, 1000.0],
