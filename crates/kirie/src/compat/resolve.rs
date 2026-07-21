@@ -90,7 +90,14 @@ pub enum Wallpaper {
         /// or, rarely, a bare `http(s)://` URL (docs/format-project-json.md §3.2).
         file: String,
     },
-    /// An application wallpaper — not yet supported by kirie (P7).
+    /// A wallpaper kirie refuses to run. `kind == "application"` is *reference
+    /// parity*, not a kirie gap: app wallpapers are Windows `.exe` items driven
+    /// by DLL injection with no Linux equivalent, and the C++ engine refuses
+    /// them too — `WallpaperParser::parse` throws
+    /// `"Application wallpapers are not supported on this platform"`
+    /// (WallpaperParser.cpp:22-24). `kind == "unknown"` covers kirie's
+    /// direct-file extension fallthrough (the reference only takes workshop
+    /// dirs, so it has no equivalent).
     Unsupported {
         /// Which type it resolved to, for the stderr message.
         kind: &'static str,
@@ -114,6 +121,12 @@ impl Wallpaper {
                 "web wallpapers need a web build (rebuild with --features web-cef or --features web-webview)"
                     .to_owned(),
             ),
+            // Application items reproduce the reference's exact refusal
+            // (WallpaperParser.cpp:22-24); other kinds (kirie's direct-file
+            // unknown-extension case) keep the kirie phrasing.
+            Wallpaper::Unsupported { kind: "application" } => {
+                Some("Application wallpapers are not supported on this platform".to_owned())
+            }
             Wallpaper::Unsupported { kind } => {
                 Some(format!("{kind} wallpapers are not yet supported by kirie"))
             }

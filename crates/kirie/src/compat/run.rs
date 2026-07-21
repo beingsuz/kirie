@@ -7,11 +7,14 @@
 //! image/gif/`.tex` file → kirie-render, scene → kirie-render scene renderer,
 //! web → the kirie-web CEF backend **when built with `--features web-cef`**
 //! (a [`WebRenderer`] blitting CEF's off-screen frames through the presentation
-//! layer). A background that cannot run on this build — an application item, or
-//! a web item in a binary without the CEF backend — gets a clean per-screen
-//! message + nonzero exit *unless* another screen can run (doc §3.1:
-//! unconfigured/unsupported screens do not sink the whole launch when a sibling
-//! is renderable).
+//! layer). An application-type item is launch-fatal with the reference's exact
+//! refusal ("Application wallpapers are not supported on this platform",
+//! WallpaperParser.cpp:22-24 — the C++ exception escapes the startup
+//! `loadBackgrounds` and kills the whole launch). Any other background that
+//! cannot run on this build — e.g. a web item in a binary without the CEF
+//! backend — gets a clean per-screen message + nonzero exit *unless* another
+//! screen can run (doc §3.1: unconfigured/unsupported screens do not sink the
+//! whole launch when a sibling is renderable).
 //!
 //! # Web feature variants
 //!
@@ -208,6 +211,11 @@ struct Target {
     bg: PathBuf,
     spec: RunSpec,
     runnable: bool,
+    /// The background is an application-type item, which is launch-fatal in
+    /// the reference (WallpaperParser.cpp:22-24 throws out of the startup
+    /// `loadBackgrounds`, main catches → exit 1) — matched in
+    /// [`run_wallpapers`].
+    app_fatal: bool,
 }
 
 /// Run the per-screen wallpapers on the wayland presentation layer, with the
@@ -217,6 +225,19 @@ fn run_wallpapers(args: CompatArgs) -> ExitCode {
     let targets = build_targets(&args);
     if targets.is_empty() {
         eprintln!("At least one background ID must be specified");
+        return ExitCode::FAILURE;
+    }
+
+    // Reference parity: an application-type background is launch-fatal even
+    // when sibling screens could run — `WallpaperParser::parse` throws
+    // "Application wallpapers are not supported on this platform"
+    // (WallpaperParser.cpp:22-24) out of the startup `loadBackgrounds`
+    // (WallpaperApplication.cpp:72/187), main catches it and exits 1. The
+    // message appears twice on stderr (`sLog.exception` writes it, then main's
+    // catch prints `e.what()` — the same string).
+    if targets.iter().any(|t| t.app_fatal) {
+        eprintln!("Application wallpapers are not supported on this platform");
+        eprintln!("Application wallpapers are not supported on this platform");
         return ExitCode::FAILURE;
     }
 
@@ -675,18 +696,21 @@ fn make_target(screen: String, bg: String, scaling: ScalingMode, clamp: ClampMod
             bg: bg_path,
             spec: RunSpec::Video { media, scaling },
             runnable: true,
+            app_fatal: false,
         },
         Ok(Wallpaper::Image { file }) => Target {
             screen,
             bg: bg_path,
             spec: RunSpec::Image { file, scaling, clamp },
             runnable: true,
+            app_fatal: false,
         },
         Ok(Wallpaper::Scene { dir }) => Target {
             screen,
             bg: bg_path,
             spec: RunSpec::Scene { dir, scaling, clamp },
             runnable: true,
+            app_fatal: false,
         },
         Ok(Wallpaper::Web { dir, file }) => make_web_target(screen, bg_path, &dir, &file),
         Ok(Wallpaper::Unsupported { kind }) => {
@@ -696,6 +720,9 @@ fn make_target(screen: String, bg: String, scaling: ScalingMode, clamp: ClampMod
                 bg: bg_path,
                 spec: RunSpec::Skip,
                 runnable: false,
+                // Application items are refused for the whole launch, exactly
+                // like the reference (WallpaperParser.cpp:22-24).
+                app_fatal: kind == "application",
             }
         }
         Ok(Wallpaper::Asset) => {
@@ -705,6 +732,7 @@ fn make_target(screen: String, bg: String, scaling: ScalingMode, clamp: ClampMod
                 bg: bg_path,
                 spec: RunSpec::Skip,
                 runnable: false,
+                app_fatal: false,
             }
         }
         Err(err) => {
@@ -715,6 +743,7 @@ fn make_target(screen: String, bg: String, scaling: ScalingMode, clamp: ClampMod
                 bg: bg_path,
                 spec: RunSpec::Skip,
                 runnable: false,
+                app_fatal: false,
             }
         }
     }
@@ -733,6 +762,7 @@ fn make_web_target(screen: String, bg: PathBuf, dir: &Path, file: &str) -> Targe
         bg,
         spec: RunSpec::Web { url },
         runnable: true,
+        app_fatal: false,
     }
 }
 
@@ -746,6 +776,7 @@ fn make_web_target(screen: String, bg: PathBuf, _dir: &Path, _file: &str) -> Tar
         bg,
         spec: RunSpec::Skip,
         runnable: false,
+        app_fatal: false,
     }
 }
 
