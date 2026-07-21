@@ -322,22 +322,10 @@ impl SceneRenderer {
             });
         }
 
-        // Camera: screen MVP = translate(ortho, eye) * lookAt (docs §9). For a
-        // centered camera the folded eye and the lookAt translation cancel, so
-        // flat z=0 layers map straight through the ortho.
+        // Camera: screen MVP = translate(ortho, eye) * lookAt, conjugated by
+        // the Y-mirror (see `screen_camera_mvp` — the X/Y camera tilt port).
         let cam = &scene.camera;
-        let far = cam.farz.max(1000.0);
-        let ortho = matrix::ortho(
-            -(proj_w as f32) / 2.0,
-            proj_w as f32 / 2.0,
-            -(proj_h as f32) / 2.0,
-            proj_h as f32 / 2.0,
-            0.0,
-            far,
-        );
-        let proj_eye = matrix::translate(&ortho, cam.eye);
-        let look = matrix::look_at(cam.eye, cam.center, cam.up);
-        let screen_mvp = matrix::mul(&proj_eye, &look);
+        let screen_mvp = screen_camera_mvp((proj_w, proj_h), cam.eye, cam.center, cam.up, cam.farz);
 
         let clear = scene.general.clearcolor.value;
         let clear_color = wgpu::Color {
@@ -2116,6 +2104,44 @@ struct BlitWindow {
     _pad: [u32; 2],
 }
 
+/// The scene screen view-projection for the 2D compositor — the reference's
+/// `Camera::setOrthogonalProjection` + `lookAt` pair (`Camera.cpp:76-91`:
+/// `ortho(-w/2..w/2, -h/2..h/2, 0, max(farz, 1000))`, then
+/// `projection = translate(projection, eye)`; `Camera.cpp:14`:
+/// `lookat = lookAt(eye, center, up)`; every image/text draw uses
+/// `projection * lookat`), **conjugated by the Y-mirror**.
+///
+/// The conjugation is the X/Y camera-tilt port: the reference composites in a
+/// Y-mirrored GL space and presents the frame vertically flipped
+/// (`WaylandOutput.cpp:34` `renderVFlip = true`; see the text
+/// `scene_space_quad` note in `extras.rs`), while kirie builds Y-up geometry
+/// and presents unflipped. Feeding the reference matrix `M` to mirrored
+/// vertices is only correct when `M` commutes with the mirror `F =
+/// diag(1,-1,1)` — true for the corpus-dominant centered camera (eye/center on
+/// the z-axis, up `+Y`, where the folded eye and the lookAt translation cancel
+/// and flat z=0 layers map straight through the ortho), but wrong for an
+/// off-axis eye/center: a vertical tilt (an `eye→center` Y displacement
+/// rotating about X) would bend the scene the mirrored way. `F · M · F`
+/// re-expresses the camera in kirie's space — X tilt (rotation about Y, xz
+/// terms) is mirror-even and unchanged; Y tilt and camera roll pick up the
+/// correctly-signed direction.
+fn screen_camera_mvp(proj: (u32, u32), eye: [f32; 3], center: [f32; 3], up: [f32; 3], farz: f32) -> Mat4 {
+    let far = farz.max(1000.0);
+    let ortho = matrix::ortho(
+        -(proj.0 as f32) / 2.0,
+        proj.0 as f32 / 2.0,
+        -(proj.1 as f32) / 2.0,
+        proj.1 as f32 / 2.0,
+        0.0,
+        far,
+    );
+    let proj_eye = matrix::translate(&ortho, eye);
+    let look = matrix::look_at(eye, center, up);
+    let reference = matrix::mul(&proj_eye, &look);
+    let flip = matrix::scale([1.0, -1.0, 1.0]);
+    matrix::mul(&flip, &matrix::mul(&reference, &flip))
+}
+
 /// Compute the scene projection size (docs §5): explicit ortho size, else an
 /// auto size from image extents, else a 1080p fallback.
 fn projection_size(model: &SceneModel) -> (u32, u32) {
@@ -2717,6 +2743,75 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Transform a point (column vector) by a column-major matrix.
+    fn apply(m: &Mat4, p: [f32; 4]) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for row in 0..4 {
+            for k in 0..4 {
+                out[row] += m[k * 4 + row] * p[k];
+            }
+        }
+        out
+    }
+
+    /// The reference's raw screen VP (`Camera.cpp:76-91` + `Camera.cpp:14`),
+    /// without kirie's mirror conjugation.
+    fn reference_mvp(proj: (u32, u32), eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
+        let ortho = matrix::ortho(
+            -(proj.0 as f32) / 2.0,
+            proj.0 as f32 / 2.0,
+            -(proj.1 as f32) / 2.0,
+            proj.1 as f32 / 2.0,
+            0.0,
+            1000.0,
+        );
+        matrix::mul(&matrix::translate(&ortho, eye), &matrix::look_at(eye, center, up))
+    }
+
+    #[test]
+    fn centered_camera_mvp_is_mirror_invariant() {
+        // The corpus-dominant camera (eye/center on the z-axis, up +Y) is
+        // Y-even, so the conjugation must be a no-op — no regression for
+        // every already-verified scene.
+        let (eye, center, up) = ([0.0, 0.0, 1000.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let conj = screen_camera_mvp((1920, 1080), eye, center, up, 1000.0);
+        let plain = reference_mvp((1920, 1080), eye, center, up);
+        for (i, (a, b)) in conj.iter().zip(plain.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "elem {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn tilted_camera_matches_the_flipped_reference() {
+        // An off-axis center tilts the view (rotation about X — the "X/Y
+        // camera tilt"). The reference draws GL-space vertices vR under its
+        // raw MVP and presents the frame vertically flipped
+        // (WaylandOutput.cpp:34); kirie draws the mirrored vertex F·vR under
+        // the conjugated MVP and presents unflipped. Both must land every
+        // point on the same clip position: conj · (F·vR) == F_ndc · (ref · vR).
+        let (eye, center, up) = ([0.0, 0.0, 1000.0], [0.0, 300.0, 0.0], [0.0, 1.0, 0.0]);
+        let conj = screen_camera_mvp((1920, 1080), eye, center, up, 1000.0);
+        let reference = reference_mvp((1920, 1080), eye, center, up);
+        for v in [
+            [0.0f32, 0.0, 0.0, 1.0],
+            [100.0, 200.0, 0.0, 1.0],
+            [-50.0, -120.0, 0.0, 1.0],
+        ] {
+            let kirie = apply(&conj, [v[0], -v[1], v[2], v[3]]);
+            let mut expected = apply(&reference, v);
+            expected[1] = -expected[1];
+            for (i, (a, b)) in kirie.iter().zip(expected.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-4, "clip {i}: {a} vs {b} for {v:?}");
+            }
+        }
+        // And the conjugation has teeth here: the unconjugated matrix would
+        // send off-center points to the mirrored (wrong-signed) tilt.
+        let p = [0.0f32, 200.0, 0.0, 1.0];
+        let old = apply(&reference, p);
+        let new = apply(&conj, p);
+        assert!((old[1] - new[1]).abs() > 1e-3, "tilt must not be mirror-even");
+    }
 
     #[test]
     fn uv_crop_scales_only_uv_columns_into_real_subrect() {
