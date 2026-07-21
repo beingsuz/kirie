@@ -36,6 +36,16 @@ pub enum Register {
         /// Its live-control handle.
         control: VideoControl,
     },
+    /// The engine swapped `screen`'s background itself (playlist rotation), so
+    /// `status` must report the on-screen path — the reference's
+    /// `setBackground` updates `screenBackgrounds` the same way
+    /// (WallpaperApplication.cpp:1050).
+    Background {
+        /// The screen whose background changed.
+        screen: String,
+        /// The new background path.
+        bg: PathBuf,
+    },
 }
 
 /// One registered background the socket reports and drives (doc §4.2, §4.7).
@@ -177,6 +187,13 @@ fn handle_register(state: &mut AppState, reg: Register) {
                 control: None,
             });
             entry.control = Some(control);
+        }
+        Register::Background { screen, bg } => {
+            let entry = state.screens.entry(screen).or_insert(ScreenEntry {
+                bg: None,
+                control: None,
+            });
+            entry.bg = Some(bg);
         }
     }
 }

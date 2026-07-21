@@ -13,6 +13,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
+use crate::compat::playlist::{self, PlaylistDefinition};
 use crate::compat::resolve;
 
 /// Wallpaper Engine's Steam Workshop app id (doc §3.4, ApplicationContext.cpp:19).
@@ -160,9 +161,10 @@ pub struct ScreenConfig {
     pub scaling: ScalingMode,
     /// Clamp mode for this screen (inherits the window default at `-r` time).
     pub clamp: ClampMode,
-    /// Per-screen playlist name, if a `--playlist` followed this `-r`
-    /// (doc §3.5; playlist *resolution* is not implemented — see run.rs).
-    pub playlist: Option<String>,
+    /// Per-screen playlist, if a `--playlist` followed this `-r` (doc §3.5):
+    /// resolved from wallpaper engine's `config.json` at parse time
+    /// (ApplicationContext.cpp:378-403); its first item seeded `background`.
+    pub playlist: Option<PlaylistDefinition>,
 }
 
 /// The fully parsed compat command line (doc §2 flag table).
@@ -183,8 +185,10 @@ pub struct CompatArgs {
     /// Window/global default clamp (doc §3.1).
     pub window_clamp: ClampMode,
     /// Window-mode default playlist (doc §3.5), if `--playlist` was given
-    /// before any `-r`.
-    pub window_playlist: Option<String>,
+    /// before any `-r` — resolved from wallpaper engine's `config.json` at
+    /// parse time (ApplicationContext.cpp:378-403). Its first item is what
+    /// window mode shows (WallpaperApplication.cpp:192-195).
+    pub window_playlist: Option<PlaylistDefinition>,
     /// `general.defaultBackground`: the last `--bg`/positional wins (doc §3.1,
     /// §3.4-resolved). `None` when never set → fatal at validation (doc §4.8).
     pub default_background: Option<String>,
@@ -506,6 +510,29 @@ enum Cursor {
 /// Total on any input (SPEC V9): every failure is a typed [`ParseError`],
 /// never a panic. Semantics mirror docs/compat-cli.md §3-§4.
 pub fn parse(args: &[OsString]) -> Result<CompatArgs, ParseError> {
+    // Lazy config.json load (`m_loadedConfigPlaylists`, ApplicationContext.cpp
+    // :161-166): the first `--playlist` loads wallpaper engine's config once;
+    // every lookup then resolves from the cached map. No `--playlist` on the
+    // command line never touches the filesystem.
+    let mut cache: Option<std::collections::BTreeMap<String, PlaylistDefinition>> = None;
+    parse_with(args, &mut |name| {
+        if cache.is_none() {
+            cache = Some(playlist::load_config_playlists()?);
+        }
+        match cache.as_ref() {
+            Some(map) => playlist::get(map, name).cloned(),
+            None => unreachable!("playlist cache filled above"),
+        }
+    })
+}
+
+/// [`parse`] with an injectable playlist loader (the C++
+/// `getPlaylistFromConfig`, called from inside the `--playlist` argparse
+/// action) so tests can resolve playlists without a Steam install.
+fn parse_with(
+    args: &[OsString],
+    load_playlist: &mut dyn FnMut(&str) -> Result<PlaylistDefinition, ParseError>,
+) -> Result<CompatArgs, ParseError> {
     let argv0 = args
         .first()
         .map(|s| s.to_string_lossy().into_owned())
@@ -613,10 +640,34 @@ pub fn parse(args: &[OsString]) -> Result<CompatArgs, ParseError> {
                 }
             }
             "--playlist" => {
+                // ApplicationContext.cpp:378-403: resolve the named playlist
+                // from wallpaper engine's config.json at parse time (a bad
+                // name/config is fatal here, like the other argparse actions).
+                // After `--screen-root` it applies to that screen and its first
+                // item becomes the screen's background; either way the first
+                // item backfills an unset default background.
                 let name = value()?;
+                let def = load_playlist(&name)?;
+                let first = def
+                    .items
+                    .first()
+                    .map(|p| p.to_string_lossy().into_owned());
                 match cursor {
-                    Cursor::Screen(idx) => out.screens[idx].playlist = Some(name),
-                    Cursor::Window => out.window_playlist = Some(name),
+                    Cursor::Screen(idx) => {
+                        if let Some(first) = &first {
+                            out.screens[idx].background = Some(first.clone());
+                        }
+                        out.screens[idx].playlist = Some(def);
+                        if out.default_background.is_none() {
+                            out.default_background = first;
+                        }
+                    }
+                    Cursor::Window => {
+                        out.window_playlist = Some(def);
+                        if out.default_background.is_none() {
+                            out.default_background = first;
+                        }
+                    }
                 }
             }
             "--scaling" => {
@@ -854,8 +905,9 @@ fn canonical_flag(name: &str) -> Option<&'static str> {
 /// screenshot-extension check lives in run.rs (it only applies when the mode
 /// runs). Returns the validated args or the fatal error.
 pub fn validate(mut args: CompatArgs) -> Result<CompatArgs, ParseError> {
-    // (1) defaultBackground empty → fatal (doc §4.8). A positional or any
-    // `--bg` satisfies this; playlists would too but are unimplemented.
+    // (1) defaultBackground empty → fatal (doc §4.8). A positional, any
+    // `--bg`, or a `--playlist` (its first item is seeded into
+    // `default_background` at parse) satisfies this.
     if args.default_background.is_none() {
         return Err(ParseError::doubled(
             "At least one background ID must be specified",
@@ -1098,6 +1150,68 @@ mod tests {
         assert_eq!(args.screens[0].background.as_deref(), Some("/a"));
         assert_eq!(args.screens[1].background.as_deref(), Some("/b"));
         assert_eq!(args.default_background.as_deref(), Some("/b"));
+    }
+
+    /// A stub playlist loader serving one two-item playlist named "day".
+    fn stub_loader(name: &str) -> Result<PlaylistDefinition, ParseError> {
+        if name == "day" {
+            Ok(PlaylistDefinition {
+                name: "day".to_owned(),
+                items: vec![PathBuf::from("/wp/one"), PathBuf::from("/wp/two")],
+                settings: crate::compat::playlist::PlaylistSettings::default(),
+            })
+        } else {
+            Err(ParseError::doubled(format!(
+                "Playlist not found in config.json: {name}"
+            )))
+        }
+    }
+
+    #[test]
+    fn playlist_before_any_screen_is_the_window_default() {
+        // ApplicationContext.cpp:386-391: no lastScreen -> defaultPlaylist; the
+        // first item backfills the (unset) default background.
+        let args = parse_with(&os(&["kirie", "--playlist", "day"]), &mut stub_loader).unwrap();
+        let pl = args.window_playlist.as_ref().unwrap();
+        assert_eq!(pl.name, "day");
+        assert_eq!(args.default_background.as_deref(), Some("/wp/one"));
+        assert!(args.screens.is_empty());
+        assert!(validate(args).is_ok(), "a playlist satisfies the background check");
+    }
+
+    #[test]
+    fn playlist_after_screen_root_targets_that_screen() {
+        // ApplicationContext.cpp:391-400: lastScreen set -> screenPlaylists +
+        // the first item becomes that screen's background and the default.
+        let args = parse_with(
+            &os(&["kirie", "--screen-root", "HDMI-A-1", "--playlist", "day"]),
+            &mut stub_loader,
+        )
+        .unwrap();
+        assert!(args.window_playlist.is_none());
+        assert_eq!(args.screens[0].playlist.as_ref().unwrap().name, "day");
+        assert_eq!(args.screens[0].background.as_deref(), Some("/wp/one"));
+        assert_eq!(args.default_background.as_deref(), Some("/wp/one"));
+    }
+
+    #[test]
+    fn playlist_does_not_override_an_explicit_default_background() {
+        // defaultBackground is only backfilled when empty
+        // (ApplicationContext.cpp:388-390).
+        let args = parse_with(
+            &os(&["kirie", "--bg", "/explicit", "--playlist", "day"]),
+            &mut stub_loader,
+        )
+        .unwrap();
+        assert_eq!(args.default_background.as_deref(), Some("/explicit"));
+        assert!(args.window_playlist.is_some());
+    }
+
+    #[test]
+    fn unknown_playlist_is_fatal_at_parse_time() {
+        let err = parse_with(&os(&["kirie", "--playlist", "nope"]), &mut stub_loader).unwrap_err();
+        assert!(err.message.contains("Playlist not found in config.json: nope"));
+        assert!(err.doubled);
     }
 
     #[test]

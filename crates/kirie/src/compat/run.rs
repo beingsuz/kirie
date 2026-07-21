@@ -7,11 +7,14 @@
 //! image/gif/`.tex` file → kirie-render, scene → kirie-render scene renderer,
 //! web → the kirie-web CEF backend **when built with `--features web-cef`**
 //! (a [`WebRenderer`] blitting CEF's off-screen frames through the presentation
-//! layer). A background that cannot run on this build — an application item, or
-//! a web item in a binary without the CEF backend — gets a clean per-screen
-//! message + nonzero exit *unless* another screen can run (doc §3.1:
-//! unconfigured/unsupported screens do not sink the whole launch when a sibling
-//! is renderable).
+//! layer). An application-type item is launch-fatal with the reference's exact
+//! refusal ("Application wallpapers are not supported on this platform",
+//! WallpaperParser.cpp:22-24 — the C++ exception escapes the startup
+//! `loadBackgrounds` and kills the whole launch). Any other background that
+//! cannot run on this build — e.g. a web item in a binary without the CEF
+//! backend — gets a clean per-screen message + nonzero exit *unless* another
+//! screen can run (doc §3.1: unconfigured/unsupported screens do not sink the
+//! whole launch when a sibling is renderable).
 //!
 //! # Web feature variants
 //!
@@ -34,15 +37,16 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kirie_audio::{AudioCapture, AudioConfig, AutoMute};
-use kirie_platform::{Platform, RenderTarget, Renderer, SurfaceSize};
+use kirie_platform::{CommandSender, Platform, RenderCommand, RenderTarget, Renderer, SurfaceSize};
 use kirie_render::{ImageContent, ImageOptions, ImageRenderer};
 use kirie_video::{VideoControl, VideoOptions, VideoPlayer, VideoRenderer};
 
 use crate::compat::args::{ClampMode, CompatArgs, ScalingMode, WindowMode};
 use crate::compat::ipc_app::{IpcApp, Register};
+use crate::compat::playlist::{ActivePlaylist, PlaylistDefinition, Rng};
 use crate::compat::resolve::{self, ClassifyError, Wallpaper};
 use crate::compat::{list_props, screenshot, signals};
 
@@ -210,6 +214,11 @@ struct Target {
     bg: PathBuf,
     spec: RunSpec,
     runnable: bool,
+    /// The background is an application-type item, which is launch-fatal in
+    /// the reference (WallpaperParser.cpp:22-24 throws out of the startup
+    /// `loadBackgrounds`, main catches → exit 1) — matched in
+    /// [`run_wallpapers`].
+    app_fatal: bool,
 }
 
 /// Run the per-screen wallpapers on the wayland presentation layer, with the
@@ -219,6 +228,19 @@ fn run_wallpapers(args: CompatArgs) -> ExitCode {
     let targets = build_targets(&args);
     if targets.is_empty() {
         eprintln!("At least one background ID must be specified");
+        return ExitCode::FAILURE;
+    }
+
+    // Reference parity: an application-type background is launch-fatal even
+    // when sibling screens could run — `WallpaperParser::parse` throws
+    // "Application wallpapers are not supported on this platform"
+    // (WallpaperParser.cpp:22-24) out of the startup `loadBackgrounds`
+    // (WallpaperApplication.cpp:72/187), main catches it and exits 1. The
+    // message appears twice on stderr (`sLog.exception` writes it, then main's
+    // catch prints `e.what()` — the same string).
+    if targets.iter().any(|t| t.app_fatal) {
+        eprintln!("Application wallpapers are not supported on this platform");
+        eprintln!("Application wallpapers are not supported on this platform");
         return ExitCode::FAILURE;
     }
 
@@ -265,6 +287,35 @@ fn run_wallpapers(args: CompatArgs) -> ExitCode {
     // factory closure — folded into the scene's property bag at build time so
     // color/combo/slider changes drive the render (docs/format-scene-json.md §3.2).
     let properties = args.set_properties.clone();
+
+    // Playlists to rotate (reference `initializePlaylists`,
+    // WallpaperApplication.cpp:265-327): the window-mode default playlist
+    // drives the single `default` wallpaper; in desktop mode each screen with
+    // a `--playlist` rotates independently. Each carries the currently shown
+    // path so rotation starts from it (WallpaperApplication.cpp:290-298).
+    let active_playlists: Vec<(String, PlaylistDefinition, Option<PathBuf>)> = if window_mode {
+        args.window_playlist
+            .clone()
+            .map(|p| {
+                let current = p.items.first().cloned();
+                ("default".to_owned(), p, current)
+            })
+            .into_iter()
+            .collect()
+    } else {
+        args.screens
+            .iter()
+            .filter_map(|s| {
+                s.playlist.clone().map(|p| {
+                    let current = s.background.clone().map(PathBuf::from);
+                    (s.name.clone(), p, current)
+                })
+            })
+            .collect()
+    };
+    let rotation_properties = args.set_properties.clone();
+    let playlist_stop = Arc::new(AtomicBool::new(false));
+    let mut playlist_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // One shared system-audio capture for every output (mono monitor source;
     // the spectrum is scene-global, docs subsystems-misc.md §1.3). Started once,
@@ -361,6 +412,26 @@ fn run_wallpapers(args: CompatArgs) -> ExitCode {
                     });
                 }
             }
+            // Playlist rotation rides the same live-swap channel as the socket
+            // `bg` command (the reference drives it from the render loop via
+            // `updatePlaylists`, WallpaperApplication.cpp:962).
+            if !active_playlists.is_empty() {
+                match platform.command_sender() {
+                    Some(cmd_tx) => {
+                        playlist_handle = spawn_playlist_rotator(
+                            active_playlists,
+                            window_mode,
+                            cmd_tx,
+                            build_ctx.clone(),
+                            rotation_properties,
+                            playlist_stop.clone(),
+                        );
+                    }
+                    None => tracing::warn!(
+                        "playlist rotation needs the live-swap command channel; disabled on this backend"
+                    ),
+                }
+            }
             // A test/CI bound on the otherwise-infinite run; the daemon never
             // sets it, so live behavior is unchanged (runs until stopped).
             let duration = std::env::var("KIRIE_RUN_SECONDS")
@@ -383,6 +454,12 @@ fn run_wallpapers(args: CompatArgs) -> ExitCode {
         }
     };
 
+    // Stop the playlist rotator and join it.
+    playlist_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = playlist_handle {
+        let _ = h.join();
+    }
+
     // Stop the automute applier and join it, then drop the detector (joins its
     // PulseAudio monitor thread) before returning.
     applier_stop.store(true, Ordering::Relaxed);
@@ -396,6 +473,140 @@ fn run_wallpapers(args: CompatArgs) -> ExitCode {
     drop(socket);
     drop(ipc_app);
     exit
+}
+
+/// Spawn the playlist rotation thread — the stand-in for the reference's
+/// per-frame `updatePlaylists` call on the render loop
+/// (WallpaperApplication.cpp:451-475/962): kirie's render thread belongs to the
+/// platform, so a dedicated timer thread polls the same conditions (timer mode,
+/// more than one item, delay elapsed) and drives swaps through the live-swap
+/// channel — the exact path the control socket's `bg` command uses.
+///
+/// `playlists` is `(screen key, definition, currently shown path)`. In window
+/// mode the single `default` wallpaper is swapped via the platform's `"*"`
+/// output selector. Returns `None` when no playlist survives registration.
+fn spawn_playlist_rotator(
+    playlists: Vec<(String, PlaylistDefinition, Option<PathBuf>)>,
+    window_mode: bool,
+    cmd_tx: CommandSender,
+    build: Arc<BuildContext>,
+    properties: Vec<(String, String)>,
+    stop: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let mut rng = Rng::seeded();
+    let now = Instant::now();
+    let mut active: Vec<(String, ActivePlaylist)> = playlists
+        .into_iter()
+        .filter_map(|(screen, def, current)| {
+            ActivePlaylist::start(def, current.as_deref(), now, &mut rng)
+                .map(|state| (screen, state))
+        })
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+    for (screen, state) in &active {
+        tracing::info!(
+            %screen,
+            playlist = state.name(),
+            items = state.item_count(),
+            "playlist registered"
+        );
+    }
+    std::thread::Builder::new()
+        .name("kirie-playlist".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
+                let now = Instant::now();
+                for (screen, state) in &mut active {
+                    if !state.due(now) {
+                        continue;
+                    }
+                    // Desktop mode targets the screen's own output; window mode
+                    // swaps the platform's primary output (`"*"`).
+                    let swap_screen = if window_mode { "*" } else { screen.as_str() };
+                    let screen_key = screen.clone();
+                    state.advance(
+                        screen,
+                        now,
+                        &mut rng,
+                        |path| playlist_preflight(&build, &screen_key, path, &properties),
+                        |path| {
+                            playlist_show(&cmd_tx, &build, &screen_key, swap_screen, path, &properties)
+                        },
+                    );
+                }
+            }
+        })
+        .ok()
+}
+
+/// Playlist candidate preflight (the reference `preflightWallpaper`,
+/// WallpaperApplication.cpp:369-389, parses the item's `project.json` before
+/// switching): can kirie build this item on this build? Web items pass only on
+/// a `web-cef` build (they swap via the render-thread path).
+fn playlist_preflight(
+    build: &Arc<BuildContext>,
+    screen: &str,
+    path: &Path,
+    properties: &[(String, String)],
+) -> bool {
+    if build
+        .build_fn(screen.to_owned(), path, properties.to_vec())
+        .is_some()
+    {
+        return true;
+    }
+    #[cfg(feature = "web-cef")]
+    if build.build_local_fn(screen.to_owned(), path).is_some() {
+        return true;
+    }
+    false
+}
+
+/// Show a playlist item (the reference `setBackground` call in
+/// `advancePlaylist`, WallpaperApplication.cpp:433-437): same dispatch as the
+/// socket `bg` swap — off-thread build + [`RenderCommand::Swap`] for
+/// video/image/scene, render-thread [`RenderCommand::SwapLocal`] for web on a
+/// `web-cef` build. On success the IPC applier is told the new background so
+/// socket `status` stays truthful (reference updates `screenBackgrounds`,
+/// WallpaperApplication.cpp:1050).
+fn playlist_show(
+    cmd_tx: &CommandSender,
+    build: &Arc<BuildContext>,
+    screen: &str,
+    swap_screen: &str,
+    path: &Path,
+    properties: &[(String, String)],
+) -> bool {
+    if let Some(build_fn) = build.build_fn(screen.to_owned(), path, properties.to_vec()) {
+        let sent = cmd_tx
+            .send(RenderCommand::Swap {
+                screen: swap_screen.to_owned(),
+                key: path.to_string_lossy().into_owned(),
+                build: build_fn,
+            })
+            .is_ok();
+        if sent {
+            build.notify_background(screen, path);
+        }
+        return sent;
+    }
+    #[cfg(feature = "web-cef")]
+    if let Some(build_local) = build.build_local_fn(screen.to_owned(), path) {
+        let sent = cmd_tx
+            .send(RenderCommand::SwapLocal {
+                screen: swap_screen.to_owned(),
+                build_local,
+            })
+            .is_ok();
+        if sent {
+            build.notify_background(screen, path);
+        }
+        return sent;
+    }
+    false
 }
 
 /// Spawn the automute applier thread: while the detector reports another app is
@@ -444,8 +655,16 @@ fn build_targets(args: &CompatArgs) -> Vec<Target> {
     let default_bg = args.default_background.clone();
     if args.mode != WindowMode::DesktopBackground {
         // Window / preview mode: one wallpaper registered as `default`
-        // (doc §3.3), rendered on every output.
-        let Some(bg) = default_bg else {
+        // (doc §3.3), rendered on every output. With a default playlist its
+        // first item is what actually shows, even over an explicit `--bg`
+        // (WallpaperApplication.cpp:187-195).
+        let bg = args
+            .window_playlist
+            .as_ref()
+            .and_then(|p| p.items.first())
+            .map(|p| p.to_string_lossy().into_owned())
+            .or(default_bg);
+        let Some(bg) = bg else {
             return Vec::new();
         };
         return vec![make_target(
@@ -480,27 +699,33 @@ fn make_target(screen: String, bg: String, scaling: ScalingMode, clamp: ClampMod
             bg: bg_path,
             spec: RunSpec::Video { media, scaling },
             runnable: true,
+            app_fatal: false,
         },
         Ok(Wallpaper::Image { file }) => Target {
             screen,
             bg: bg_path,
             spec: RunSpec::Image { file, scaling, clamp },
             runnable: true,
+            app_fatal: false,
         },
         Ok(Wallpaper::Scene { dir }) => Target {
             screen,
             bg: bg_path,
             spec: RunSpec::Scene { dir, scaling, clamp },
             runnable: true,
+            app_fatal: false,
         },
         Ok(Wallpaper::Web { dir, file }) => make_web_target(screen, bg_path, &dir, &file),
         Ok(Wallpaper::Unsupported { kind }) => {
-            tracing::warn!(%screen, kind, "wallpaper type not yet supported by kirie");
+            tracing::warn!(%screen, kind, "wallpaper type not supported");
             Target {
                 screen,
                 bg: bg_path,
                 spec: RunSpec::Skip,
                 runnable: false,
+                // Application items are refused for the whole launch, exactly
+                // like the reference (WallpaperParser.cpp:22-24).
+                app_fatal: kind == "application",
             }
         }
         Ok(Wallpaper::Asset) => {
@@ -510,6 +735,7 @@ fn make_target(screen: String, bg: String, scaling: ScalingMode, clamp: ClampMod
                 bg: bg_path,
                 spec: RunSpec::Skip,
                 runnable: false,
+                app_fatal: false,
             }
         }
         Err(err) => {
@@ -520,6 +746,7 @@ fn make_target(screen: String, bg: String, scaling: ScalingMode, clamp: ClampMod
                 bg: bg_path,
                 spec: RunSpec::Skip,
                 runnable: false,
+                app_fatal: false,
             }
         }
     }
@@ -541,6 +768,7 @@ fn make_web_target(screen: String, bg: PathBuf, dir: &Path, file: &str) -> Targe
             dir: dir.to_path_buf(),
         },
         runnable: true,
+        app_fatal: false,
     }
 }
 
@@ -554,6 +782,7 @@ fn make_web_target(screen: String, bg: PathBuf, _dir: &Path, _file: &str) -> Tar
         bg,
         spec: RunSpec::Skip,
         runnable: false,
+        app_fatal: false,
     }
 }
 
@@ -882,6 +1111,19 @@ pub(crate) struct BuildContext {
 }
 
 impl BuildContext {
+    /// Report an engine-driven background change (playlist rotation) to the
+    /// IPC applier so socket `status` reflects the on-screen path — the
+    /// reference's `setBackground` updates `screenBackgrounds` the same way
+    /// (WallpaperApplication.cpp:1050). No-op without a control socket.
+    pub(crate) fn notify_background(&self, screen: &str, path: &Path) {
+        if let Some(reg) = &self.registrar {
+            let _ = reg.send(Register::Background {
+                screen: screen.to_owned(),
+                bg: path.to_path_buf(),
+            });
+        }
+    }
+
     /// Classify `path` and return an off-thread [`kirie_platform::BuildFn`] that
     /// builds it for `screen` with `properties`. `None` when the wallpaper isn't
     /// runnable, or is web (web is `!Send` / render-thread-only).
