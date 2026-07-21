@@ -5,17 +5,20 @@
 //! scene container (docs §10, `AssetLocator.cpp:72-79`); names prefixed `_rt_`
 //! or `_alias_` are FBO references resolved by the renderer instead
 //! (docs §6). Each `.tex` is decoded via the shared [`crate::ImageContent`]
-//! path (its first page — animated-atlas frame advance is a documented seam
-//! here) and uploaded once. A shader sampler with no bound/resolvable texture
-//! falls back to the built-in 1×1 white texture (the reference's `util/white`
-//! default, docs §8.2).
+//! path and uploaded once; a multi-frame animated `.tex` additionally
+//! registers an [`AtlasTexture`] so the renderer can advance its frames per
+//! tick exactly like the reference (`CPass.cpp:348-378`
+//! `resolveTextureAnimationState`). A shader sampler with no bound/resolvable
+//! texture falls back to the built-in 1×1 white texture (the reference's
+//! `util/white` default, docs §8.2).
 
 use std::collections::HashMap;
 
 use kirie_scene::resolve::AssetSource;
 
-use crate::content::ImageContent;
+use crate::content::{FramePlacement, ImageContent, ImagePage};
 use crate::error::RenderError;
+use crate::schedule::FrameSchedule;
 
 /// One uploaded texture with its sampler and mip-0 dimensions.
 #[derive(Debug)]
@@ -38,6 +41,12 @@ pub struct GpuTexture {
     /// crop does not apply to). Sampling the layer texture 0..1 without this
     /// leak the padding region (a solid block) into the composited layer.
     pub uv_crop: [f32; 2],
+    /// The logical (real) content size reported as `g_TextureNResolution.zw`:
+    /// the `.tex` header crop for stills, `gifWidth/gifHeight` for animated
+    /// atlases — exactly the reference's `CTexture::setupResolution`
+    /// (`CTexture.cpp:149-153`: animated → `{texW, texH, gifW, gifH}`).
+    /// Defaults to the uploaded page size.
+    pub real_size: [f32; 2],
 }
 
 /// A name-keyed cache of uploaded pass textures plus the fallback white texture
@@ -55,6 +64,45 @@ pub struct VideoTexture {
     pub size: (u32, u32),
 }
 
+/// A multi-frame animated `.tex` (spritesheet atlas or gif-style multi-page,
+/// docs/format-tex.md §8-§9). The reference animates these per pass: it picks
+/// the frame with the `fmod(renderTime, Σ frametime)` walk, binds the frame's
+/// page (`bindTextureUnit(0, texture, frame.frameNumber)`) and feeds the
+/// frame's placement to `g_Texture0Translation` / `g_Texture0Rotation`
+/// (`CPass.cpp:287-306, 348-378`; `CRenderable.cpp:31-36`). kirie mirrors the
+/// [`VideoTexture`] pattern: all passes keep binding one [`GpuTexture`]; the
+/// renderer streams the current frame's page into it on page change and drives
+/// the placement builtins from [`AtlasTexture::placement_at`] each frame.
+pub struct AtlasTexture {
+    /// Playback frames in file order (docs/format-tex.md §8.1).
+    pub frames: Vec<FramePlacement>,
+    /// The §8.1 frametime walk over `frames` (the reference's
+    /// `resolveTextureAnimationState` selection, `CPass.cpp:355-365`).
+    pub schedule: FrameSchedule,
+    /// Decoded CPU pages for multi-page (gif-style) textures, streamed into
+    /// `gpu` when the displayed frame's page changes — the wgpu equivalent of
+    /// the reference's `glBindTexture(textureID[frameNumber])` page switch
+    /// (docs/format-tex.md §9). Empty for single-page spritesheets, whose
+    /// animation is placement-only.
+    pub pages: Vec<ImagePage>,
+    /// The texture every pass bound — holds the current frame's page.
+    pub gpu: std::sync::Arc<GpuTexture>,
+}
+
+impl AtlasTexture {
+    /// The frame displayed at `elapsed` wall-clock seconds — the reference's
+    /// `fmod(renderTime, animationTime)` frametime walk (`CPass.cpp:355-365`).
+    #[must_use]
+    pub fn placement_at(&self, elapsed: f64) -> &FramePlacement {
+        // `frame_at` is always in range for a non-empty table; registration
+        // guarantees at least two frames (SPEC.md §V9 guard regardless).
+        let index = self.schedule.frame_at(elapsed).min(self.frames.len() - 1);
+        &self.frames[index]
+    }
+}
+
+/// A name-keyed cache of uploaded pass textures plus the fallback white texture
+/// (docs §6, §8.2). One registry per scene build.
 pub struct TextureRegistry {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -63,6 +111,10 @@ pub struct TextureRegistry {
     /// Video-backed textures kept playing; the renderer takes these after build
     /// ([`Self::take_videos`]) and streams frames per render tick.
     videos: Vec<VideoTexture>,
+    /// Animated atlases by texture name; objects look up their layer's atlas
+    /// ([`Self::atlas_for`]) and the renderer takes the list after build
+    /// ([`Self::take_atlases`]) to advance pages per render tick.
+    atlases: HashMap<String, std::sync::Arc<AtlasTexture>>,
 }
 
 impl TextureRegistry {
@@ -93,6 +145,7 @@ impl TextureRegistry {
             queue: queue.clone(),
             cache: HashMap::new(),
             videos: Vec::new(),
+            atlases: HashMap::new(),
             white,
         }
     }
@@ -202,9 +255,11 @@ impl TextureRegistry {
         let page = content.pages.first()?;
         // The frame-0 UV crop trims NPOT padding for a still image (the
         // reference's `texcoordCopy = realSize / textureSize`, docs §7.1). Only
-        // a single still frame is cropped here; animated atlases keep 0..1 (the
-        // per-frame placement is a documented seam, not applied to the layer
-        // geometry). `axes = [realW/texW, 0, 0, realH/texH]` for a still.
+        // a single still frame is cropped here; animated atlases keep 0..1
+        // exactly like the reference ("animations should be copied completely",
+        // `CImage.cpp:308-316`) — their per-frame placement is applied by the
+        // shader via `g_Texture0Translation`/`g_Texture0Rotation` instead.
+        // `axes = [realW/texW, 0, 0, realH/texH]` for a still.
         let uv_crop = match content.frames.as_slice() {
             [only] => [only.axes[0], only.axes[3]],
             _ => [1.0, 1.0],
@@ -220,7 +275,47 @@ impl TextureRegistry {
             content.sampler.clamp_uvs,
         );
         gpu.uv_crop = uv_crop;
-        Some(std::sync::Arc::new(gpu))
+        // `g_TextureNResolution.zw` is the logical content size: the header
+        // crop for stills, `gifWidth/gifHeight` for animated atlases
+        // (`CTexture.cpp:149-153` `setupResolution`).
+        gpu.real_size = [content.content_width as f32, content.content_height as f32];
+        let gpu = std::sync::Arc::new(gpu);
+        self.register_atlas(name, content, &gpu);
+        Some(gpu)
+    }
+
+    /// Register a decoded multi-frame `.tex` for per-tick animation (the
+    /// reference's `CPass` texture-animation state, `CPass.cpp:348-378`).
+    /// Multi-page (gif-style) content keeps its CPU pages for page streaming;
+    /// pages whose dimensions differ from page 0 cannot stream into the one
+    /// bound texture, so such content stays a static frame 0 (SPEC.md §V9 —
+    /// malformed input degrades, never breaks).
+    fn register_atlas(&mut self, name: &str, content: ImageContent, gpu: &std::sync::Arc<GpuTexture>) {
+        let Some(multi_page) = atlas_animates(&content) else {
+            if content.frames.len() > 1 {
+                tracing::debug!(texture = %name, "animated .tex not streamable; keeping static frame 0");
+            }
+            return;
+        };
+        let schedule = content.schedule();
+        self.atlases.insert(
+            name.to_string(),
+            std::sync::Arc::new(AtlasTexture {
+                frames: content.frames,
+                schedule,
+                // Single-page spritesheets never re-upload; drop their pixels.
+                pages: if multi_page { content.pages } else { Vec::new() },
+                gpu: gpu.clone(),
+            }),
+        );
+    }
+
+    /// The animated atlas registered for texture `name`, if any. Objects whose
+    /// layer texture is animated hold this to drive the per-pass
+    /// `g_Texture0Translation`/`g_Texture0Rotation` builtins (docs §8.3).
+    #[must_use]
+    pub fn atlas_for(&self, name: &str) -> Option<std::sync::Arc<AtlasTexture>> {
+        self.atlases.get(name).cloned()
     }
 
     /// Decode the **first frame** of an MP4 video texture and upload it as a
@@ -302,6 +397,34 @@ impl TextureRegistry {
     pub fn take_videos(&mut self) -> Vec<VideoTexture> {
         std::mem::take(&mut self.videos)
     }
+
+    /// Hand the animated atlases to the renderer (called once after build; the
+    /// registry is discarded afterwards). The renderer advances each atlas per
+    /// render tick and streams multi-page frames into the bound texture.
+    pub fn take_atlases(&mut self) -> Vec<std::sync::Arc<AtlasTexture>> {
+        std::mem::take(&mut self.atlases).into_values().collect()
+    }
+}
+
+/// Whether decoded content animates as an atlas, and how: `Some(false)` — a
+/// single-page spritesheet (placement-only animation, no page uploads);
+/// `Some(true)` — a multi-page (gif-style) texture whose uniform-size pages
+/// can stream into the one bound texture (the reference's per-frame
+/// `textureID[frameNumber]` bind, docs/format-tex.md §9); `None` — static
+/// (one frame, a zero-duration table the reference would `fmod` into NaN on,
+/// or pages of differing sizes that cannot stream — SPEC.md §V9 degrade).
+fn atlas_animates(content: &ImageContent) -> Option<bool> {
+    if content.frames.len() <= 1 || !content.schedule().is_animated() {
+        return None;
+    }
+    let multi_page = content.frames.iter().any(|f| f.page != 0);
+    if multi_page {
+        let (w0, h0) = (content.pages[0].width, content.pages[0].height);
+        if content.pages.iter().any(|p| (p.width, p.height) != (w0, h0)) {
+            return None;
+        }
+    }
+    Some(multi_page)
 }
 
 /// Upload a tightly-packed RGBA8 buffer as a sampled texture with a matching
@@ -384,5 +507,70 @@ fn upload_rgba8(
         width,
         height,
         uv_crop: [1.0, 1.0],
+        real_size: [width as f32, height as f32],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::content::SamplerSpec;
+
+    use super::*;
+
+    fn content(pages: Vec<(u32, u32)>, frames: Vec<(usize, f32)>) -> ImageContent {
+        ImageContent {
+            pages: pages
+                .into_iter()
+                .map(|(width, height)| ImagePage {
+                    width,
+                    height,
+                    pixels: vec![0; (width * height * 4) as usize],
+                })
+                .collect(),
+            frames: frames
+                .into_iter()
+                .map(|(page, duration)| FramePlacement {
+                    page,
+                    duration,
+                    translation: [0.0, 0.0],
+                    axes: [1.0, 0.0, 0.0, 1.0],
+                })
+                .collect(),
+            sampler: SamplerSpec {
+                nearest: false,
+                clamp_uvs: true,
+            },
+            content_width: 4,
+            content_height: 4,
+        }
+    }
+
+    #[test]
+    fn spritesheets_animate_without_page_streaming() {
+        // All frames on one page: placement-only animation (the reference's
+        // g_Texture0Translation/Rotation path, CPass.cpp:287-306).
+        let c = content(vec![(8, 8)], vec![(0, 0.1), (0, 0.1)]);
+        assert_eq!(atlas_animates(&c), Some(false));
+    }
+
+    #[test]
+    fn uniform_multi_page_gifs_stream_pages() {
+        // Frames on different equal-size pages: the reference's
+        // textureID[frameNumber] bind (docs/format-tex.md §9).
+        let c = content(vec![(4, 4), (4, 4)], vec![(0, 0.1), (1, 0.1)]);
+        assert_eq!(atlas_animates(&c), Some(true));
+    }
+
+    #[test]
+    fn static_and_malformed_content_never_animates() {
+        // One frame: a still.
+        let single = content(vec![(4, 4)], vec![(0, 0.0)]);
+        assert_eq!(atlas_animates(&single), None);
+        // All-zero durations: the reference would fmod(t, 0) into NaN (V9).
+        let zero = content(vec![(4, 4)], vec![(0, 0.0), (0, 0.0)]);
+        assert_eq!(atlas_animates(&zero), None);
+        // Mismatched page sizes cannot stream into one texture (V9 degrade).
+        let mismatched = content(vec![(4, 4), (8, 8)], vec![(0, 0.1), (1, 0.1)]);
+        assert_eq!(atlas_animates(&mismatched), None);
     }
 }

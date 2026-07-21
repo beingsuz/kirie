@@ -144,6 +144,19 @@ struct ObjectGpu {
     /// Ping-pong index holding the final composite after the full chain (the
     /// view dependents bind). `None` when the object has no composite FBOs.
     final_front: Option<usize>,
+    /// The layer texture's animated atlas, when the base material's slot-0
+    /// `.tex` is multi-frame. The first (layer-sampling) pass drives its
+    /// `g_Texture0Translation`/`g_Texture0Rotation` builtins from this per
+    /// frame — the reference's per-pass texture-animation state
+    /// (`CPass.cpp:287-306`). Page streaming lives on [`SceneRenderer`].
+    atlas: Option<Arc<super::texture::AtlasTexture>>,
+}
+
+/// One animated atlas plus the page currently uploaded into its bound texture
+/// (see [`SceneRenderer::atlas_textures`]).
+struct AtlasSlot {
+    atlas: Arc<super::texture::AtlasTexture>,
+    uploaded_page: usize,
 }
 
 /// A script-created runtime layer (`thisScene.createLayer`, docs §6.2) — the
@@ -209,6 +222,14 @@ pub struct SceneRenderer {
     /// render tick (the reference plays these — a frozen first frame was the
     /// 3445942378 divergence).
     video_textures: Vec<super::texture::VideoTexture>,
+    /// Animated `.tex` atlases (docs/format-tex.md §8-§9): per render tick the
+    /// current frame is selected by the reference's frametime walk
+    /// (`CPass.cpp:348-378`) and, for multi-page (gif-style) textures, the
+    /// frame's page streams into the one texture every pass bound — the wgpu
+    /// equivalent of the reference's `textureID[frameNumber]` bind
+    /// (`CPass.cpp:380-387`). `uploaded_page` tracks the page currently in the
+    /// texture so unchanged frames upload nothing (SPEC.md §V5).
+    atlas_textures: Vec<AtlasSlot>,
     /// Surface-normalized pointer, top-left origin (T26; platform-fed). Centered
     /// until the platform knows the cursor — the old hardcoded default.
     pointer: [f32; 2],
@@ -308,22 +329,10 @@ impl SceneRenderer {
             });
         }
 
-        // Camera: screen MVP = translate(ortho, eye) * lookAt (docs §9). For a
-        // centered camera the folded eye and the lookAt translation cancel, so
-        // flat z=0 layers map straight through the ortho.
+        // Camera: screen MVP = translate(ortho, eye) * lookAt, conjugated by
+        // the Y-mirror (see `screen_camera_mvp` — the X/Y camera tilt port).
         let cam = &scene.camera;
-        let far = cam.farz.max(1000.0);
-        let ortho = matrix::ortho(
-            -(proj_w as f32) / 2.0,
-            proj_w as f32 / 2.0,
-            -(proj_h as f32) / 2.0,
-            proj_h as f32 / 2.0,
-            0.0,
-            far,
-        );
-        let proj_eye = matrix::translate(&ortho, cam.eye);
-        let look = matrix::look_at(cam.eye, cam.center, cam.up);
-        let screen_mvp = matrix::mul(&proj_eye, &look);
+        let screen_mvp = screen_camera_mvp((proj_w, proj_h), cam.eye, cam.center, cam.up, cam.farz);
 
         let clear = scene.general.clearcolor.value;
         let clear_color = wgpu::Color {
@@ -627,6 +636,15 @@ impl SceneRenderer {
             sprite_scratch: Vec::new(),
             pack_scratch: Vec::new(),
             video_textures: registry.take_videos(),
+            atlas_textures: registry
+                .take_atlases()
+                .into_iter()
+                .map(|atlas| AtlasSlot {
+                    atlas,
+                    // `load` uploaded page 0 (the first page) at build time.
+                    uploaded_page: 0,
+                })
+                .collect(),
             pointer: [0.5, 0.5],
             pointer_last: [0.5, 0.5],
             parallax_disp: [0.0, 0.0],
@@ -847,6 +865,12 @@ fn build_object(
     let layer_tex = base_layer_texture(image, source, registry);
     let layer_reads_scene = base_layer_name(image).as_deref().is_some_and(is_scene_rt);
     let mut reads_scene = layer_reads_scene;
+    // The layer texture's animated atlas, if `load` registered one for its
+    // name (multi-frame `.tex`). Drives the first pass's `g_Texture0*` frame
+    // placement builtins per frame (`CPass.cpp:287-306`, docs §8.3).
+    let layer_atlas = base_layer_name(image)
+        .filter(|n| !n.starts_with("_rt_") && !n.starts_with("_alias_"))
+        .and_then(|n| registry.atlas_for(&n));
 
     // The layer's own transform (docs §7.1: the `sceneSpacePosition` quad is
     // built at the *scaled* size, rotated about its center by the negated Z
@@ -1275,6 +1299,7 @@ fn build_object(
         offscreen_donor,
         final_front: comp_front,
         parallax_depth: image.parallax_depth.value,
+        atlas: layer_atlas,
     })
 }
 
@@ -1463,6 +1488,49 @@ impl Renderer for SceneRenderer {
             }
         }
 
+        // Advance animated `.tex` atlases (docs/format-tex.md §8-§9): select
+        // the frame with the reference's `fmod(renderTime, Σ frametime)` walk
+        // (`CPass.cpp:348-378`) and, when the frame lives on another page
+        // (gif-style multi-image .tex), stream that page into the one texture
+        // every pass bound — the wgpu stand-in for the reference's
+        // `glBindTexture(textureID[frameNumber])` (`CPass.cpp:380-387`).
+        // Single-page spritesheets upload nothing here; their placement rides
+        // the `g_Texture0Translation`/`g_Texture0Rotation` builtins instead.
+        for slot in &mut self.atlas_textures {
+            let frame = slot.atlas.placement_at(self.elapsed);
+            if frame.page == slot.uploaded_page {
+                continue;
+            }
+            let Some(page) = slot.atlas.pages.get(frame.page) else {
+                continue; // single-page atlas (no CPU pages retained)
+            };
+            let gpu = &slot.atlas.gpu;
+            // Registration guarantees uniform page dims; guard anyway (V9).
+            if (page.width, page.height) != (gpu.width, gpu.height) {
+                continue;
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &page.pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * page.width),
+                    rows_per_image: Some(page.height),
+                },
+                wgpu::Extent3d {
+                    width: page.width,
+                    height: page.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            slot.uploaded_page = frame.page;
+        }
+
         // Sweep 0 — dependency donors (docs §5.6): render their image-space
         // composites FIRST, unconditionally (they are invisible by design), so
         // dependents sample this frame's content. Their passes only write their
@@ -1480,6 +1548,7 @@ impl Renderer for SceneRenderer {
                     self.ambient,
                     self.skylight,
                     time,
+                    self.elapsed,
                     texel,
                     audio,
                     pack_scratch,
@@ -1520,6 +1589,7 @@ impl Renderer for SceneRenderer {
                         self.ambient,
                         self.skylight,
                         time,
+                        self.elapsed,
                         texel,
                         audio,
                         pack_scratch,
@@ -1941,6 +2011,7 @@ fn apply_runtime_updates(
 /// object mutably while reading the renderer's other fields.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn draw_image_object(
     encoder: &mut wgpu::CommandEncoder,
     queue: &wgpu::Queue,
@@ -1950,6 +2021,7 @@ fn draw_image_object(
     ambient: [f32; 3],
     skylight: [f32; 3],
     time: f32,
+    elapsed: f64,
     texel: [f32; 2],
     audio: Option<&AudioSpectrum>,
     scratch: &mut Vec<u8>,
@@ -1968,7 +2040,22 @@ fn draw_image_object(
     } else {
         screen_mvp
     };
-    for pass in &object.passes {
+    // Animated-atlas frame placement for the layer texture (the reference's
+    // per-pass `resolveTextureAnimationState`, `CPass.cpp:287-306, 348-378`):
+    // `g_Texture0Translation = frame origin / page dims`, `g_Texture0Rotation =
+    // frame axes / page dims`. Only the pass that samples the layer texture
+    // (the first pass — every later pass's texture0 is a composite FBO, which
+    // the reference reports as not-animated) receives the state; SPRITESHEET
+    // shaders remap `v_TexCoord` from it (`genericimage2.vert:99-101`).
+    let atlas_anim = object.atlas.as_ref().map(|a| {
+        let f = a.placement_at(elapsed);
+        (f.translation, f.axes)
+    });
+    for (pass_index, pass) in object.passes.iter().enumerate() {
+        let (t0_translation, t0_rotation) = match (pass_index, &atlas_anim) {
+            (0, Some((t, r))) => (*t, *r),
+            _ => ([0.0, 0.0], [0.0, 0.0, 0.0, 0.0]),
+        };
         // Per-frame builtins for this pass.
         let mvp = match pass.geometry {
             // Scene-space geometry (flat quad or scene-space puppet mesh) maps
@@ -2022,8 +2109,8 @@ fn draw_image_object(
             model: pass.model_matrix,
             view_projection: matrix::IDENTITY,
             eye: [0.0, 0.0, 1000.0],
-            texture0_translation: [0.0, 0.0],
-            texture0_rotation: [0.0, 0.0, 0.0, 0.0],
+            texture0_translation: t0_translation,
+            texture0_rotation: t0_rotation,
             texture_resolution: pass.tex_resolution,
             // Live audio bands (mono; Left == Right, filled by `components`).
             // Silent (zeros) when no capture is running (docs §8.3).
@@ -2097,6 +2184,44 @@ struct BlitWindow {
     /// every layer) and tanks SSIM against the oracle.
     srgb: u32,
     _pad: [u32; 2],
+}
+
+/// The scene screen view-projection for the 2D compositor — the reference's
+/// `Camera::setOrthogonalProjection` + `lookAt` pair (`Camera.cpp:76-91`:
+/// `ortho(-w/2..w/2, -h/2..h/2, 0, max(farz, 1000))`, then
+/// `projection = translate(projection, eye)`; `Camera.cpp:14`:
+/// `lookat = lookAt(eye, center, up)`; every image/text draw uses
+/// `projection * lookat`), **conjugated by the Y-mirror**.
+///
+/// The conjugation is the X/Y camera-tilt port: the reference composites in a
+/// Y-mirrored GL space and presents the frame vertically flipped
+/// (`WaylandOutput.cpp:34` `renderVFlip = true`; see the text
+/// `scene_space_quad` note in `extras.rs`), while kirie builds Y-up geometry
+/// and presents unflipped. Feeding the reference matrix `M` to mirrored
+/// vertices is only correct when `M` commutes with the mirror `F =
+/// diag(1,-1,1)` — true for the corpus-dominant centered camera (eye/center on
+/// the z-axis, up `+Y`, where the folded eye and the lookAt translation cancel
+/// and flat z=0 layers map straight through the ortho), but wrong for an
+/// off-axis eye/center: a vertical tilt (an `eye→center` Y displacement
+/// rotating about X) would bend the scene the mirrored way. `F · M · F`
+/// re-expresses the camera in kirie's space — X tilt (rotation about Y, xz
+/// terms) is mirror-even and unchanged; Y tilt and camera roll pick up the
+/// correctly-signed direction.
+fn screen_camera_mvp(proj: (u32, u32), eye: [f32; 3], center: [f32; 3], up: [f32; 3], farz: f32) -> Mat4 {
+    let far = farz.max(1000.0);
+    let ortho = matrix::ortho(
+        -(proj.0 as f32) / 2.0,
+        proj.0 as f32 / 2.0,
+        -(proj.1 as f32) / 2.0,
+        proj.1 as f32 / 2.0,
+        0.0,
+        far,
+    );
+    let proj_eye = matrix::translate(&ortho, eye);
+    let look = matrix::look_at(eye, center, up);
+    let reference = matrix::mul(&proj_eye, &look);
+    let flip = matrix::scale([1.0, -1.0, 1.0]);
+    matrix::mul(&flip, &matrix::mul(&reference, &flip))
 }
 
 /// Compute the scene projection size (docs §5): explicit ortho size, else an
@@ -2334,15 +2459,12 @@ fn create_puppet_index_buffer(
 /// (docs §7.1). Base UVs run 0..1; after this they run 0..crop, so sampling the
 /// padded `.tex` page hits only the real image and the padding never composites.
 /// `g_TextureNResolution` value for a texture: `(texW, texH, realW, realH)`,
-/// where `real = tex × uv_crop` recovers the NPOT real size baked into the page
-/// (docs/format-tex.md §8.1). Shaders derive the padding crop as `real/tex`.
+/// where `real` is the logical content size — the NPOT header crop for stills,
+/// `gifWidth/gifHeight` for animated atlases — exactly the reference's
+/// `CTexture::setupResolution` (`CTexture.cpp:149-153`; docs/format-tex.md
+/// §8.1). Shaders derive the padding crop as `real/tex`.
 pub(super) fn tex_res(t: &super::texture::GpuTexture) -> [f32; 4] {
-    [
-        t.width as f32,
-        t.height as f32,
-        t.width as f32 * t.uv_crop[0],
-        t.height as f32 * t.uv_crop[1],
-    ]
+    [t.width as f32, t.height as f32, t.real_size[0], t.real_size[1]]
 }
 
 /// Scale a quad's UV columns (indices 3, 4) into a texture's real sub-rect —
@@ -2756,6 +2878,75 @@ gl_FragColor = texSample2D(g_Texture0, v_TexCoord);\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Transform a point (column vector) by a column-major matrix.
+    fn apply(m: &Mat4, p: [f32; 4]) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for row in 0..4 {
+            for k in 0..4 {
+                out[row] += m[k * 4 + row] * p[k];
+            }
+        }
+        out
+    }
+
+    /// The reference's raw screen VP (`Camera.cpp:76-91` + `Camera.cpp:14`),
+    /// without kirie's mirror conjugation.
+    fn reference_mvp(proj: (u32, u32), eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
+        let ortho = matrix::ortho(
+            -(proj.0 as f32) / 2.0,
+            proj.0 as f32 / 2.0,
+            -(proj.1 as f32) / 2.0,
+            proj.1 as f32 / 2.0,
+            0.0,
+            1000.0,
+        );
+        matrix::mul(&matrix::translate(&ortho, eye), &matrix::look_at(eye, center, up))
+    }
+
+    #[test]
+    fn centered_camera_mvp_is_mirror_invariant() {
+        // The corpus-dominant camera (eye/center on the z-axis, up +Y) is
+        // Y-even, so the conjugation must be a no-op — no regression for
+        // every already-verified scene.
+        let (eye, center, up) = ([0.0, 0.0, 1000.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let conj = screen_camera_mvp((1920, 1080), eye, center, up, 1000.0);
+        let plain = reference_mvp((1920, 1080), eye, center, up);
+        for (i, (a, b)) in conj.iter().zip(plain.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "elem {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn tilted_camera_matches_the_flipped_reference() {
+        // An off-axis center tilts the view (rotation about X — the "X/Y
+        // camera tilt"). The reference draws GL-space vertices vR under its
+        // raw MVP and presents the frame vertically flipped
+        // (WaylandOutput.cpp:34); kirie draws the mirrored vertex F·vR under
+        // the conjugated MVP and presents unflipped. Both must land every
+        // point on the same clip position: conj · (F·vR) == F_ndc · (ref · vR).
+        let (eye, center, up) = ([0.0, 0.0, 1000.0], [0.0, 300.0, 0.0], [0.0, 1.0, 0.0]);
+        let conj = screen_camera_mvp((1920, 1080), eye, center, up, 1000.0);
+        let reference = reference_mvp((1920, 1080), eye, center, up);
+        for v in [
+            [0.0f32, 0.0, 0.0, 1.0],
+            [100.0, 200.0, 0.0, 1.0],
+            [-50.0, -120.0, 0.0, 1.0],
+        ] {
+            let kirie = apply(&conj, [v[0], -v[1], v[2], v[3]]);
+            let mut expected = apply(&reference, v);
+            expected[1] = -expected[1];
+            for (i, (a, b)) in kirie.iter().zip(expected.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-4, "clip {i}: {a} vs {b} for {v:?}");
+            }
+        }
+        // And the conjugation has teeth here: the unconjugated matrix would
+        // send off-center points to the mirrored (wrong-signed) tilt.
+        let p = [0.0f32, 200.0, 0.0, 1.0];
+        let old = apply(&reference, p);
+        let new = apply(&conj, p);
+        assert!((old[1] - new[1]).abs() > 1e-3, "tilt must not be mirror-even");
+    }
 
     #[test]
     fn puppet_base_forces_translucent_blending() {

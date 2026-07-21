@@ -371,6 +371,7 @@ pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, raster: &TextRaster) -
         width,
         height,
         uv_crop: [1.0, 1.0],
+        real_size: [width as f32, height as f32],
     }
 }
 
