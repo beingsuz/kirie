@@ -467,10 +467,34 @@ impl<'a> Cursor<'a> {
 // i.e. 48 bytes of geometry (pos+normal+tangent+uv) interleaved with 32 bytes
 // of skinning (4 bone indices + 4 weights). This parser exposes the full
 // [`PuppetVertex`] — positions/uv/indices as the reference reads them, plus the
-// skinning the reference discards — so the renderer can apply the animation
-// layers the reference cannot. Bytes after the index block (bones, the `MDLS`
-// animation tables) are left for a later pass, exactly as the reference leaves
-// them here.
+// skinning the reference discards — so a future renderer *could* apply the
+// animation layers the reference cannot.
+//
+// # Bones / skeletal animation: parity-complete as STATIC (verified)
+//
+// The reference never implements bones, skinning, or skeletal animation
+// anywhere — a whole-tree grep of `linux-wallpaperengine/src/WallpaperEngine`
+// for bone/skelet/skin matches nothing but an unrelated comment. Concretely:
+//
+// * The plain `.mdl` parser reads only version/meshCount and per-mesh
+//   material/bbox/flags/vertices/indices (`ObjectParser.cpp:242-286`); no bone
+//   chunk is ever decoded, and `CModel` uploads the 48-byte records as-is into
+//   static GL buffers (`CModel.cpp:120-188`). The only model animation the
+//   reference has is the scene-JSON `anglesAnimation` keyframe track
+//   (`CModel.cpp:220-243`), which kirie ports in
+//   `kirie-render/src/scene/model.rs` (`AnimationTrack::sample`).
+// * The puppet path reads only `position` (offset 0) and `uv` (offset 72) and
+//   draws the mesh as a static, undeformed triangle list
+//   (`CImage.cpp:466-517`); the `MDLS` marker is used purely as a scan
+//   *boundary* (`CImage.cpp:448-457`) — the animation tables behind it are
+//   never parsed. The scene-JSON `animationlayers` are parsed into the data
+//   model (`ObjectParser.cpp:417-441`) but consumed by NO render code (zero
+//   references outside the parser/struct).
+//
+// So there is nothing further to port for parity: bytes after the puppet index
+// block (bone tables, the `MDLS` animation tables) are deliberately ignored
+// here, exactly as the reference ignores them. Decoding them would be
+// invention beyond the reference, not a port.
 //
 // V9: every read is bounds-checked; malformed puppets yield a typed
 // [`PuppetError`], never a panic.
