@@ -559,7 +559,10 @@ fn playlist_preflight(
         return true;
     }
     #[cfg(feature = "web-cef")]
-    if build.build_local_fn(screen.to_owned(), path).is_some() {
+    if build
+        .build_local_fn(screen.to_owned(), path, properties.to_vec())
+        .is_some()
+    {
         return true;
     }
     false
@@ -594,7 +597,7 @@ fn playlist_show(
         return sent;
     }
     #[cfg(feature = "web-cef")]
-    if let Some(build_local) = build.build_local_fn(screen.to_owned(), path) {
+    if let Some(build_local) = build.build_local_fn(screen.to_owned(), path, properties.to_vec()) {
         let sent = cmd_tx
             .send(RenderCommand::SwapLocal {
                 screen: swap_screen.to_owned(),
