@@ -13,8 +13,11 @@
 //!   (browser process) and the shim-injecting render-process handler.
 //! * [`client`] — the OSR [`cef::Client`] + [`cef::RenderHandler`] whose
 //!   `on_paint` publishes frames into the lock-free slot.
-//! * [`backend`] — [`CefBackend`], the [`crate::WebBackend`] that owns the CEF
-//!   thread, the message-loop pump, and browser lifecycle.
+//! * [`registry`] — the CEF thread's per-browser state table (id allocation,
+//!   shared sizes, pointer edge derivation); one initialized CEF context hosts
+//!   one browser per [`CefBackend`] (multi-monitor web).
+//! * [`backend`] — [`CefBackend`], the [`crate::WebBackend`] that owns one
+//!   browser on the shared CEF thread (message-loop pump + browser lifecycle).
 //!
 //! # Safety (SPEC §V2)
 //!
@@ -26,5 +29,6 @@
 pub mod app;
 pub mod backend;
 pub mod client;
+pub mod registry;
 
 pub use backend::CefBackend;

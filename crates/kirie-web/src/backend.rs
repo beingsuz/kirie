@@ -3,11 +3,14 @@
 //! A web wallpaper is a headless browser rendered off-screen: the browser
 //! paints into a CPU pixel buffer that the GPU side uploads to a texture and
 //! blits fullscreen (docs/subsystems-misc.md §3, "offscreen (windowless)
-//! rendering"). Two backends produce those buffers — the Chromium Embedded
-//! Framework OSR backend ([`crate::cef`], feature `cef`) and, later, a
-//! `webkit2gtk`/`wry` backend — and both implement the single [`WebBackend`]
-//! trait defined here so the presentation layer never learns which browser
-//! engine is in use.
+//! rendering"). The Chromium Embedded Framework OSR backend ([`crate::cef`],
+//! feature `cef`) produces those buffers behind the single [`WebBackend`]
+//! trait defined here, so the presentation layer never learns which browser
+//! engine is in use. It is the **only** implementor: the `webview`
+//! (wry/webkit2gtk) backend cannot satisfy this contract — webkit2gtk has no
+//! off-screen/pixel-readback path and its views are `!Send` (upstream
+//! limitation; see the `webview` module docs) — so it lives outside the trait
+//! as a native-surface fallback.
 //!
 //! Threading (SPEC §V4 "render never blocks"): the browser runs its own
 //! message loop on a dedicated thread and publishes finished frames through a
@@ -188,12 +191,6 @@ pub enum WebError {
     /// The requested backend was compiled out (its feature was disabled).
     #[error("web backend `{0}` is not compiled in (enable its cargo feature)")]
     BackendDisabled(&'static str),
-
-    /// CEF is a process-global singleton and one is already live in this
-    /// process; a second concurrent backend cannot be created
-    /// (docs/subsystems-misc.md §3: "CEF can only be initialized once").
-    #[error("a CEF browser context is already active in this process")]
-    AlreadyActive,
 
     /// `CefInitialize` failed (missing libcef runtime files, bad flags, …).
     #[error("failed to initialize the CEF browser context: {0}")]
