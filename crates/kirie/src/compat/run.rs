@@ -23,11 +23,11 @@
 //!   and blits), so it slots straight into the wgpu presentation layer here and
 //!   into `--screenshot`.
 //! * **`web-webview`** — the wry/webkit2gtk backend renders into its *own* GTK
-//!   window, not a wgpu surface, and needs a GTK background surface the current
-//!   presentation layer does not hand off. A `web-webview`-only binary therefore
-//!   still reports web wallpapers as not-yet-runnable at dispatch time (the
-//!   backend links and is release-built; wiring its native surface is pending
-//!   platform support).
+//!   window, not a wgpu surface: webkit2gtk has no off-screen/pixel-readback
+//!   path, so it can never composite through this presentation layer (upstream
+//!   wry/webkit2gtk limitation — won't-fix; see `kirie-web/src/webview/mod.rs`
+//!   for the API-level evidence). A `web-webview`-only binary therefore reports
+//!   web wallpapers as unrunnable at dispatch time and points at `web-cef`.
 //! * **Both enabled** — the CEF backend is preferred (it is the one that
 //!   composites through this layer).
 //! * **Neither** — the default build: web wallpapers report a clean message
@@ -802,9 +802,9 @@ fn classify_reason(err: &ClassifyError) -> String {
 fn web_unrunnable_note() -> String {
     #[cfg(all(feature = "web-webview", not(feature = "web-cef")))]
     {
-        "web wallpapers are not yet runnable on the webview backend (it renders into a \
-         GTK background surface the presentation layer does not yet provide); rebuild with \
-         --features web-cef for the working off-screen web backend"
+        "web wallpapers cannot run on the webview backend: wry/webkit2gtk renders into \
+         its own native window and has no off-screen path (upstream limitation, won't-fix); \
+         rebuild with --features web-cef for the composited off-screen web backend"
             .to_owned()
     }
     #[cfg(not(any(feature = "web-cef", feature = "web-webview")))]

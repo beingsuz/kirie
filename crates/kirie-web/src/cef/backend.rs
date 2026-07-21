@@ -2,88 +2,149 @@
 //! off-screen rendering.
 //!
 //! CEF is single-threaded and process-global: every CEF object must live on
-//! the one thread that called `cef_initialize`, and `cef_initialize` /
-//! `cef_shutdown` may run at most once per process (docs/subsystems-misc.md
-//! §3). So this backend owns a dedicated **CEF thread**: it initializes CEF,
-//! creates the windowless browser, and pumps `cef_do_message_loop_work` in a
-//! paced loop, servicing resize/pointer/mute/shutdown commands over a channel.
-//! The render side only ever reads the lock-free frame slot the render handler
-//! publishes into (SPEC §V4 — render never blocks on the browser).
+//! the one thread that called `cef_initialize`, and `cef_do_message_loop_work`
+//! must be pumped on that same thread (docs/subsystems-misc.md §3). So one
+//! dedicated **CEF thread** owns the whole CEF lifetime: it initializes CEF,
+//! creates windowless browsers on demand, and pumps `cef_do_message_loop_work`
+//! in a paced loop, servicing create/resize/pointer/mute/props/close commands
+//! over a channel (property batches are queued per browser and delivered after
+//! that browser's first published paint — see
+//! [`super::registry::BrowserEntry::drain_props_if_painted`]). The render side only ever reads the lock-free frame slot each
+//! browser's render handler publishes into (SPEC §V4 — render never blocks on
+//! the browser).
 //!
-//! # Singleton
+//! # One CEF context, many browsers
 //!
-//! Because CEF is a process singleton, only one [`CefBackend`] may be live at
-//! a time; a second [`CefBackend::new`] returns [`WebError::AlreadyActive`].
-//! (Multi-monitor web wallpapers would share one CEF context and one browser
-//! per output — future work; the reference engine does exactly this with a
-//! single `WebBrowserContext`.)
+//! `cef_initialize` may run at most once at a time per process, but an
+//! initialized context hosts **any number** of browsers — the reference engine
+//! runs one browser per output through a single `WebBrowserContext`. Each
+//! [`CefBackend`] therefore owns one *browser* (its id, frame slot, and shared
+//! size), not the CEF context:
+//!
+//! * the **first** [`CefBackend::new`] spawns the CEF thread (which reserves
+//!   the process-global context via [`MANAGER`]) and creates its browser on it;
+//! * every **subsequent** `new` sends a [`Command::Create`] to the existing
+//!   thread and gets back its own [`BrowserId`] + frame slot — this is what
+//!   lets a second web wallpaper run on another monitor;
+//! * [`CefBackend::shutdown`] closes only *its* browser; the shared context
+//!   stays up for the others. Full `cef_shutdown` runs when the **last**
+//!   backend drops (the thread quits, and a later `new` starts fresh —
+//!   sequential re-init, same as the previous singleton behaviour).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use cef::{
-    BrowserSettings, CefString, ImplBrowser, ImplBrowserHost, ImplFrame, MouseButtonType, MouseEvent,
-    Settings, WindowInfo, api_hash, args::Args, browser_host_create_browser_sync, do_message_loop_work,
-    initialize, shutdown, sys::CEF_API_VERSION_LAST,
+    Browser, BrowserSettings, CefString, ImplBrowser, ImplBrowserHost, ImplFrame, MouseButtonType,
+    MouseEvent, Settings, WindowInfo, api_hash, args::Args, browser_host_create_browser_sync,
+    do_message_loop_work, initialize, shutdown, sys::CEF_API_VERSION_LAST,
 };
 
 use crate::backend::{FrameBuffer, FrameSlot, PointerState, WebBackend, WebError, WebFrameRef, WebSize};
 
 use super::client::{SharedSize, make_client};
-
-/// Process-global "a CEF context is live" flag. CEF forbids a second
-/// `cef_initialize`, so this gates construction rather than modelling app
-/// state (SPEC §V1 permits an FFI-singleton guard for a C library that *is* a
-/// singleton).
-static CEF_ALIVE: AtomicBool = AtomicBool::new(false);
+use super::registry::{BrowserEntry, BrowserId, BrowserRegistry};
 
 /// Target off-screen paint rate. The reference clamps to `max(60, fps)`
 /// (docs/subsystems-misc.md §3.5); 60 is CEF's documented cap.
 const FRAME_RATE: i32 = 60;
 
-/// A command sent from the render side to the CEF thread.
+/// How long [`CefBackend::shutdown`] waits for the CEF thread to confirm its
+/// browser closed before giving up (a wedged thread must not hang the caller;
+/// the close command stays queued and is still honoured whenever the thread
+/// gets to it).
+const CLOSE_WAIT: Duration = Duration::from_secs(10);
+
+/// A command sent from a backend handle to the shared CEF thread.
 enum Command {
-    Resize(i32, i32),
-    Pointer(PointerState),
-    Mute(bool),
-    /// Deliver a `__wpApplyProps` JSON batch to the page (queued until the
-    /// browser's main frame exists, then executed in order).
-    ApplyProps(String),
-    Shutdown,
+    /// Create a windowless browser; reply with its id (or the failure).
+    Create(CreateRequest),
+    /// Resize one browser's off-screen surface.
+    Resize(BrowserId, i32, i32),
+    /// Latest pointer sample for one browser.
+    Pointer(BrowserId, PointerState),
+    /// (Un)mute one browser's audio.
+    Mute(BrowserId, bool),
+    /// Deliver a `__wpApplyProps` JSON batch to one browser's page (queued in
+    /// its registry entry until that browser's first published paint, then
+    /// executed in order).
+    ApplyProps(BrowserId, String),
+    /// Close one browser (the context stays up); ack when done.
+    Close(BrowserId, Sender<()>),
+    /// Tear the whole context down (sent when the last backend drops).
+    Quit,
+}
+
+/// Everything the CEF thread needs to create one browser.
+struct CreateRequest {
+    url: String,
+    muted: bool,
+    slot: FrameSlot,
+    size: Arc<SharedSize>,
+    reply: Sender<Result<BrowserId, WebError>>,
 }
 
 /// One-time configuration handed to the CEF thread at spawn.
 struct ThreadConfig {
-    url: String,
-    muted: bool,
     runtime_dir: PathBuf,
     helper_path: Option<PathBuf>,
-    slot: FrameSlot,
-    size: Arc<SharedSize>,
     rx: Receiver<Command>,
 }
 
-/// A CEF-backed web wallpaper.
-pub struct CefBackend {
-    slot: FrameSlot,
-    cmd_tx: Option<Sender<Command>>,
+/// The process-global handle on the running CEF thread.
+///
+/// CEF forbids concurrent double-init, so thread spawn / reuse / teardown is
+/// serialized through this mutex (SPEC §V1 permits an FFI-singleton guard for
+/// a C library that *is* a singleton). The CEF thread itself never touches
+/// [`MANAGER`] — it talks only through channels — so holding the lock across a
+/// create/join cannot deadlock.
+struct Manager {
+    tx: Sender<Command>,
     thread: Option<JoinHandle<()>>,
+    /// Number of live [`CefBackend`] handles sharing the thread.
+    live: usize,
+}
+
+/// See [`Manager`].
+static MANAGER: Mutex<Option<Manager>> = Mutex::new(None);
+
+/// Lock [`MANAGER`], recovering from a poisoned lock (a panicking backend
+/// must not permanently wedge web wallpapers).
+fn manager_lock() -> std::sync::MutexGuard<'static, Option<Manager>> {
+    MANAGER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Ask the CEF thread to quit and join it, clearing the global slot.
+fn stop_thread(guard: &mut Option<Manager>) {
+    if let Some(mut mgr) = guard.take() {
+        let _ = mgr.tx.send(Command::Quit);
+        if let Some(thread) = mgr.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A CEF-backed web wallpaper: one windowless browser on the shared CEF thread.
+pub struct CefBackend {
+    id: BrowserId,
+    tx: Sender<Command>,
+    slot: FrameSlot,
     /// Cached handle on the latest published frame so [`Self::latest_frame`]
     /// can hand out a borrow tied to `&self`.
     cached: Option<Arc<FrameBuffer>>,
+    /// `true` once [`Self::shutdown`] ran (it must be idempotent, and `Drop`
+    /// calls it again).
+    closed: bool,
 }
 
 impl CefBackend {
     fn send(&self, cmd: Command) {
-        if let Some(tx) = &self.cmd_tx {
-            // A closed channel means the thread already exited; ignore.
-            let _ = tx.send(cmd);
-        }
+        // A closed channel means the thread already exited; ignore.
+        let _ = self.tx.send(cmd);
     }
 }
 
@@ -91,58 +152,81 @@ impl WebBackend for CefBackend {
     fn new(url: &str, size: WebSize) -> Result<Self, WebError> {
         let size = size.clamped();
 
-        // Reserve the process-global CEF slot.
-        if CEF_ALIVE
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(WebError::AlreadyActive);
-        }
-
-        let runtime_dir = resolve_runtime_dir()
-            .ok_or_else(|| WebError::Init("could not locate the CEF runtime dir (icudtl.dat)".into()))?;
-        let helper_path = resolve_helper_path(&runtime_dir);
-
         let slot: FrameSlot = Arc::new(ArcSwapOption::empty());
         let shared_size = SharedSize::new(size.width as i32, size.height as i32);
-        let (tx, rx) = channel();
-
-        let config = ThreadConfig {
+        let (reply_tx, reply_rx) = channel();
+        let request = CreateRequest {
             url: url.to_string(),
             muted: false,
-            runtime_dir,
-            helper_path,
             slot: slot.clone(),
             size: shared_size,
-            rx,
+            reply: reply_tx,
         };
 
-        // Result of CEF init/create is reported back so `new` can fail loudly.
-        let (ready_tx, ready_rx) = channel::<Result<(), WebError>>();
-        let thread = std::thread::Builder::new()
-            .name("kirie-cef".into())
-            .spawn(move || cef_thread_main(config, &ready_tx))
-            .map_err(|e| {
-                CEF_ALIVE.store(false, Ordering::SeqCst);
-                WebError::Thread(e.to_string())
-            })?;
+        // Serialize thread spawn/reuse and the create round-trip: the lock is
+        // held until the browser exists so a concurrent shutdown of the last
+        // sibling cannot tear the thread down under us.
+        let mut guard = manager_lock();
 
-        // Wait for the thread to report init success/failure.
-        let outcome = ready_rx
+        let tx = match guard.as_ref() {
+            Some(mgr) => mgr.tx.clone(),
+            None => {
+                // First backend (or first after a full teardown): spawn the
+                // CEF thread. It initializes CEF and then services commands.
+                let runtime_dir = resolve_runtime_dir().ok_or_else(|| {
+                    WebError::Init("could not locate the CEF runtime dir (icudtl.dat)".into())
+                })?;
+                let helper_path = resolve_helper_path(&runtime_dir);
+                let (tx, rx) = channel();
+                let config = ThreadConfig {
+                    runtime_dir,
+                    helper_path,
+                    rx,
+                };
+                let thread = std::thread::Builder::new()
+                    .name("kirie-cef".into())
+                    .spawn(move || cef_thread_main(config))
+                    .map_err(|e| WebError::Thread(e.to_string()))?;
+                *guard = Some(Manager {
+                    tx: tx.clone(),
+                    thread: Some(thread),
+                    live: 0,
+                });
+                tx
+            }
+        };
+
+        if tx.send(Command::Create(request)).is_err() {
+            // The thread died unexpectedly; reap it so the next attempt can
+            // start fresh.
+            stop_thread(&mut guard);
+            return Err(WebError::Init("the CEF thread is gone".into()));
+        }
+
+        let outcome = reply_rx
             .recv()
-            .unwrap_or_else(|_| Err(WebError::Init("CEF thread exited before init".into())));
+            .unwrap_or_else(|_| Err(WebError::Init("the CEF thread exited during browser creation".into())));
 
         match outcome {
-            Ok(()) => Ok(Self {
-                slot,
-                cmd_tx: Some(tx),
-                thread: Some(thread),
-                cached: None,
-            }),
+            Ok(id) => {
+                if let Some(mgr) = guard.as_mut() {
+                    mgr.live += 1;
+                }
+                Ok(Self {
+                    id,
+                    tx,
+                    slot,
+                    cached: None,
+                    closed: false,
+                })
+            }
             Err(e) => {
-                // Init failed; join the thread (which clears CEF_ALIVE via its
-                // guard) and surface the error.
-                let _ = thread.join();
+                // If no sibling backend is live, don't leave a browserless
+                // thread pumping forever (init failures also land here — the
+                // thread has already exited and the join reaps it).
+                if guard.as_ref().is_some_and(|mgr| mgr.live == 0) {
+                    stop_thread(&mut guard);
+                }
                 Err(e)
             }
         }
@@ -171,26 +255,42 @@ impl WebBackend for CefBackend {
 
     fn resize(&mut self, size: WebSize) {
         let size = size.clamped();
-        self.send(Command::Resize(size.width as i32, size.height as i32));
+        self.send(Command::Resize(self.id, size.width as i32, size.height as i32));
     }
 
     fn send_pointer(&mut self, pointer: PointerState) {
-        self.send(Command::Pointer(pointer));
+        self.send(Command::Pointer(self.id, pointer));
     }
 
     fn set_muted(&mut self, muted: bool) {
-        self.send(Command::Mute(muted));
+        self.send(Command::Mute(self.id, muted));
     }
 
     fn apply_properties(&mut self, json: &str) {
-        self.send(Command::ApplyProps(json.to_owned()));
+        self.send(Command::ApplyProps(self.id, json.to_owned()));
     }
 
     fn shutdown(&mut self) {
-        self.send(Command::Shutdown);
-        self.cmd_tx = None;
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+
+        // Close this browser (the shared context stays up for siblings) and
+        // wait — bounded — for the ack so the browser is really gone before we
+        // decide whether the context itself should come down.
+        let (done_tx, done_rx) = channel();
+        if self.tx.send(Command::Close(self.id, done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(CLOSE_WAIT);
+        }
+
+        // Last backend out tears the whole context down.
+        let mut guard = manager_lock();
+        if let Some(mgr) = guard.as_mut() {
+            mgr.live = mgr.live.saturating_sub(1);
+            if mgr.live == 0 {
+                stop_thread(&mut guard);
+            }
         }
     }
 }
@@ -201,35 +301,22 @@ impl Drop for CefBackend {
     }
 }
 
-/// The CEF thread: init → create browser → pump loop → shutdown.
-fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
-    // Release the process singleton whatever happens.
-    struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            CEF_ALIVE.store(false, Ordering::SeqCst);
-        }
-    }
-    let _guard = Guard;
-
+/// The CEF thread: init → service the browser registry → shutdown.
+fn cef_thread_main(config: ThreadConfig) {
     // Negotiate the CEF API version before constructing any CEF object. The
     // cef-rs wrappers stamp each struct's version from this global; skipping it
     // makes libcef reject the app with "invalid version -1".
     let _ = api_hash(CEF_API_VERSION_LAST, 0);
 
     let ThreadConfig {
-        url,
-        muted,
         runtime_dir,
         helper_path,
-        slot,
-        size,
         rx,
     } = config;
 
-    // A disposable per-run Chrome profile dir; removed after `cef_shutdown`
-    // so repeated runs (e.g. daemon restarts) do not leak profile trees under
-    // the temp dir.
+    // A disposable per-run Chrome profile dir, shared by every browser this
+    // thread hosts; removed after `cef_shutdown` so repeated runs (e.g. daemon
+    // restarts) do not leak profile trees under the temp dir.
     let cache_dir = throwaway_cache_dir();
 
     // --- CefSettings (docs/subsystems-misc.md §3.2) -----------------------
@@ -252,9 +339,9 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
     let args = Args::new();
     let mut app = super::app::make_app();
 
-    // `initialize` is the safe cef-rs wrapper over `cef_initialize`; it is
-    // called exactly once per process on this thread (guarded by CEF_ALIVE),
-    // the precondition the CEF C ABI requires.
+    // `initialize` is the safe cef-rs wrapper over `cef_initialize`; MANAGER
+    // guarantees at most one CEF thread is live, the precondition the CEF C
+    // ABI requires.
     let init_ok = initialize(
         Some(args.as_main_args()),
         Some(&settings),
@@ -262,61 +349,16 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
         std::ptr::null_mut(),
     );
     if init_ok != 1 {
-        let _ = ready.send(Err(WebError::Init(
-            "cef_initialize returned failure (missing libcef runtime files?)".into(),
-        )));
+        // Fail whoever is already waiting with the precise reason; later
+        // senders see the closed channel when this thread returns.
+        fail_pending(&rx);
         return;
     }
-
-    // --- Create the windowless browser (docs §3.5) ------------------------
-    // Keep a handle on the frame slot: property delivery is gated on the first
-    // published paint (the page has run its scripts and registered
-    // `wallpaperPropertyListener` by then — the reference delivers on the first
-    // rendered frame too, CWeb.cpp).
-    let paint_slot = slot.clone();
-    let mut client = make_client(slot, size.clone());
-    let window_info = WindowInfo::default().set_as_windowless(0);
-    let browser_settings = BrowserSettings {
-        windowless_frame_rate: FRAME_RATE,
-        ..Default::default()
-    };
-    let url_str = CefString::from(url.as_str());
-
-    let browser = browser_host_create_browser_sync(
-        Some(&window_info),
-        Some(&mut client),
-        Some(&url_str),
-        Some(&browser_settings),
-        None,
-        None,
-    );
-
-    let Some(browser) = browser else {
-        let _ = ready.send(Err(WebError::BrowserCreation));
-        shutdown();
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        return;
-    };
-
-    // Apply the initial mute state.
-    if muted && let Some(host) = browser.host() {
-        host.set_audio_muted(1);
-    }
-
-    // Init succeeded — unblock `new`.
-    let _ = ready.send(Ok(()));
 
     // --- Pump loop --------------------------------------------------------
+    let mut registry: BrowserRegistry<Browser> = BrowserRegistry::new();
     let frame_dt = Duration::from_secs_f64(1.0 / f64::from(FRAME_RATE));
-    let mut pointer = PointerState::default();
-    let mut last_left = false;
-    let mut last_right = false;
     let audio_zero = [0.0f32; 128];
-
-    // Property batches waiting for the page (reference CWeb.cpp delivers the
-    // full set on the first rendered frame — the page may block its init on
-    // applyUserProperties; later singles are live property changes).
-    let mut pending_props: Vec<String> = Vec::new();
 
     'pump: loop {
         let frame_start = Instant::now();
@@ -324,63 +366,59 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
         // Drain pending commands.
         loop {
             match rx.try_recv() {
-                Ok(Command::Resize(w, h)) => {
-                    size.set(w, h);
-                    if let Some(host) = browser.host() {
-                        host.was_resized();
+                Ok(Command::Create(req)) => match create_browser(&req) {
+                    Some(browser) => {
+                        let id = registry.insert(browser, req.size.clone(), req.slot.clone());
+                        let _ = req.reply.send(Ok(id));
+                    }
+                    None => {
+                        let _ = req.reply.send(Err(WebError::BrowserCreation));
+                    }
+                },
+                Ok(Command::Resize(id, w, h)) => {
+                    if let Some(entry) = registry.get_mut(id) {
+                        entry.size.set(w, h);
+                        if let Some(host) = entry.browser.host() {
+                            host.was_resized();
+                        }
                     }
                 }
-                Ok(Command::Pointer(p)) => pointer = p,
-                Ok(Command::Mute(m)) => {
-                    if let Some(host) = browser.host() {
+                Ok(Command::Pointer(id, p)) => {
+                    if let Some(entry) = registry.get_mut(id) {
+                        entry.set_pointer(p);
+                    }
+                }
+                Ok(Command::Mute(id, m)) => {
+                    if let Some(entry) = registry.get_mut(id)
+                        && let Some(host) = entry.browser.host()
+                    {
                         host.set_audio_muted(i32::from(m));
                     }
                 }
-                Ok(Command::ApplyProps(json)) => pending_props.push(json),
-                Ok(Command::Shutdown) => break 'pump,
+                Ok(Command::ApplyProps(id, json)) => {
+                    if let Some(entry) = registry.get_mut(id) {
+                        entry.push_props(json);
+                    }
+                }
+                Ok(Command::Close(id, done)) => {
+                    if let Some(entry) = registry.remove(id) {
+                        close_browser(entry.browser);
+                    }
+                    let _ = done.send(());
+                }
+                Ok(Command::Quit) => break 'pump,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break 'pump,
             }
         }
 
-        // Forward pointer + audio, mirroring CWeb::pushBridgeData (§3.5).
-        if let Some(host) = browser.host() {
-            let event = MouseEvent {
-                x: pointer.x,
-                y: pointer.y,
-                modifiers: 0,
-            };
-            host.send_mouse_move_event(Some(&event), 0);
-            if pointer.left != last_left {
-                host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, i32::from(!pointer.left), 1);
-                last_left = pointer.left;
-            }
-            if pointer.right != last_right {
-                host.send_mouse_click_event(
-                    Some(&event),
-                    MouseButtonType::RIGHT,
-                    i32::from(!pointer.right),
-                    1,
-                );
-                last_right = pointer.right;
-            }
-        }
-        if let Some(frame) = browser.main_frame() {
-            let js = CefString::from(crate::shim::audio_call(&audio_zero).as_str());
-            frame.execute_java_script(Some(&js), None, 0);
-            // Deliver queued property batches only after the first published
-            // paint: executing earlier races the page's own scripts — the shim
-            // finds no `wallpaperPropertyListener` yet and silently drops the
-            // batch (the reference also delivers on the first rendered frame).
-            if !pending_props.is_empty() && paint_slot.load_full().is_some() {
-                for json in pending_props.drain(..) {
-                    let call = CefString::from(crate::shim::apply_user_properties_call(&json).as_str());
-                    frame.execute_java_script(Some(&call), None, 0);
-                }
-            }
+        // Forward pointer + audio to every live browser, mirroring
+        // CWeb::pushBridgeData (§3.5).
+        for (_, entry) in registry.iter_mut() {
+            drive_browser(entry, &audio_zero);
         }
 
-        // Pump CEF once; OnPaint fires here on this thread.
+        // Pump CEF once; every browser's OnPaint fires here on this thread.
         do_message_loop_work();
 
         // Pace to the target frame rate.
@@ -389,19 +427,109 @@ fn cef_thread_main(config: ThreadConfig, ready: &Sender<Result<(), WebError>>) {
         }
     }
 
-    // --- Shutdown (docs §3.5): close, let the async close settle, shutdown.
-    if let Some(host) = browser.host() {
-        host.close_browser(1);
+    // --- Shutdown (docs §3.5): close the survivors, let the async closes
+    // settle, then shut the context down.
+    for (_, entry) in registry.drain() {
+        close_browser(entry.browser);
     }
     for _ in 0..10 {
         do_message_loop_work();
         std::thread::sleep(Duration::from_millis(5));
     }
-    drop(browser);
     shutdown();
     // CEF has fully torn down (all its threads joined); the throwaway profile
     // dir can be reclaimed.
     let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+/// Create one windowless browser for `req` (docs §3.5). Must run on the CEF
+/// thread, after a successful `initialize`.
+fn create_browser(req: &CreateRequest) -> Option<Browser> {
+    let mut client = make_client(req.slot.clone(), req.size.clone());
+    let window_info = WindowInfo::default().set_as_windowless(0);
+    let browser_settings = BrowserSettings {
+        windowless_frame_rate: FRAME_RATE,
+        ..Default::default()
+    };
+    let url_str = CefString::from(req.url.as_str());
+
+    let browser = browser_host_create_browser_sync(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&url_str),
+        Some(&browser_settings),
+        None,
+        None,
+    )?;
+
+    // Apply the initial mute state.
+    if req.muted && let Some(host) = browser.host() {
+        host.set_audio_muted(1);
+    }
+    Some(browser)
+}
+
+/// Force-close one browser and drop our handle; the ongoing pump services the
+/// asynchronous close while the context (and any sibling browsers) stay up.
+fn close_browser(browser: Browser) {
+    if let Some(host) = browser.host() {
+        host.close_browser(1);
+    }
+    drop(browser);
+}
+
+/// Per-frame per-browser bridge data: pointer move, click edges, the audio
+/// spectrum call (silent for now), and any deliverable property batches,
+/// mirroring CWeb::pushBridgeData (§3.5).
+fn drive_browser(entry: &mut BrowserEntry<Browser>, audio_zero: &[f32]) {
+    let pointer = entry.pointer();
+    let left_edge = entry.left_edge();
+    let right_edge = entry.right_edge();
+    if let Some(host) = entry.browser.host() {
+        let event = MouseEvent {
+            x: pointer.x,
+            y: pointer.y,
+            modifiers: 0,
+        };
+        host.send_mouse_move_event(Some(&event), 0);
+        if let Some(down) = left_edge {
+            host.send_mouse_click_event(Some(&event), MouseButtonType::LEFT, i32::from(!down), 1);
+        }
+        if let Some(down) = right_edge {
+            host.send_mouse_click_event(Some(&event), MouseButtonType::RIGHT, i32::from(!down), 1);
+        }
+    }
+    if let Some(frame) = entry.browser.main_frame() {
+        let js = CefString::from(crate::shim::audio_call(audio_zero).as_str());
+        frame.execute_java_script(Some(&js), None, 0);
+        // Queued property batches are released only after *this* browser's
+        // first published paint (its own frame slot is non-empty; see
+        // `BrowserEntry::drain_props_if_painted`), then executed in order on
+        // its main frame. Draining inside the `main_frame` arm keeps batches
+        // queued when the frame does not exist yet.
+        for json in entry.drain_props_if_painted() {
+            let call = CefString::from(crate::shim::apply_user_properties_call(&json).as_str());
+            frame.execute_java_script(Some(&call), None, 0);
+        }
+    }
+}
+
+/// After a failed `cef_initialize`: answer the commands already queued (a
+/// waiting `new` gets the precise error instead of a bare disconnect).
+fn fail_pending(rx: &Receiver<Command>) {
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            Command::Create(req) => {
+                let _ = req.reply.send(Err(WebError::Init(
+                    "cef_initialize returned failure (missing libcef runtime files?)".into(),
+                )));
+            }
+            Command::Close(_, done) => {
+                let _ = done.send(());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Locate the directory holding the CEF runtime files (`libcef.so`,

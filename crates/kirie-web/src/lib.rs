@@ -36,12 +36,17 @@ pub mod cef;
 
 /// The wry + system-`webkit2gtk` native-surface backend (feature `webview`).
 ///
+/// **Status: permanent fallback, not a [`WebBackend`] — won't-fix upstream.**
 /// Unlike [`cef`], this backend renders straight into a host-provided
-/// background window instead of an off-screen buffer, so it does *not*
-/// implement the [`WebBackend`] trait (a `wry::WebView` is `!Send` and yields
-/// no CPU frame); see [`webview`] for the model and its `webkit2gtk-4.1` build
-/// requirement. The `unsafe` it needs (borrowing raw window handles) is why the
-/// crate-level `forbid(unsafe_code)` is relaxed for this feature too.
+/// background window instead of an off-screen buffer, so it cannot implement
+/// the [`WebBackend`] trait: wry's webkit2gtk backend exposes no off-screen /
+/// pixel-readback path at all, and a `wry::WebView` is `!Send` (GTK
+/// main-thread-bound). Both are upstream library facts, not missing kirie
+/// work — see [`webview`] for the evidence (wry 0.55.1 API survey) and the
+/// native-surface model, plus its `webkit2gtk-4.1` build requirement. Prefer
+/// the `cef` feature for composited web wallpapers. The `unsafe` this backend
+/// needs (borrowing raw window handles) is why the crate-level
+/// `forbid(unsafe_code)` is relaxed for this feature too.
 #[cfg(feature = "webview")]
 pub mod webview;
 

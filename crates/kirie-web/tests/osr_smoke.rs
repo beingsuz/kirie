@@ -77,6 +77,59 @@ fn osr_renders_corpus_index() {
     );
 }
 
+/// Two backends share one CEF context: both paint concurrently (the
+/// multi-monitor web case), and closing one leaves the other painting.
+#[test]
+#[ignore = "needs libcef runtime; run explicitly with LD_LIBRARY_PATH set"]
+fn osr_two_browsers_share_one_context() {
+    let url = format!("file://{CORPUS_INDEX}");
+    let size_a = WebSize {
+        width: 1280,
+        height: 720,
+    };
+    let size_b = WebSize {
+        width: 800,
+        height: 600,
+    };
+
+    let mut a = CefBackend::new(&url, size_a).expect("create first CEF backend");
+    // The second backend must join the same context instead of failing on the
+    // old process-singleton gate.
+    let mut b = CefBackend::new(&url, size_b).expect("create second CEF backend");
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let (mut a_painted, mut b_painted) = (false, false);
+    while Instant::now() < deadline && !(a_painted && b_painted) {
+        a.tick(1.0 / 60.0);
+        b.tick(1.0 / 60.0);
+        if let Some(f) = a.latest_frame() {
+            a_painted = !is_blank(f.data);
+            assert_eq!((f.width, f.height), (1280, 720), "A paints at its own size");
+        }
+        if let Some(f) = b.latest_frame() {
+            b_painted = !is_blank(f.data);
+            assert_eq!((f.width, f.height), (800, 600), "B paints at its own size");
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(a_painted, "first browser never painted a non-blank frame");
+    assert!(b_painted, "second browser never painted a non-blank frame");
+
+    // Closing A must not tear the shared context down: B keeps painting.
+    a.shutdown();
+    let mut b_after = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !b_after {
+        b.tick(1.0 / 60.0);
+        if let Some(f) = b.latest_frame() {
+            b_after = !is_blank(f.data);
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(b_after, "second browser stopped painting after the first shut down");
+    b.shutdown();
+}
+
 /// A frame is "blank" if every pixel is identical (uniform colour, e.g. the
 /// transparent/white default before the page renders anything).
 fn is_blank(data: &[u8]) -> bool {
