@@ -258,9 +258,10 @@ pub fn build_text_pipeline(device: &wgpu::Device) -> TextPipeline {
 ///
 /// The quad is sized from the *rasterized* block (the WE `size` box when set,
 /// else the measured glyph extent) times the object's `scale`, and centered on
-/// the object origin (docs §7.1 centered Y-up geometry). This uses the image
-/// Y-up convention rather than `CText`'s vflip-aware one (docs §7.4) — a minor
-/// position gap; the glyphs themselves are real.
+/// the object origin under `CText`'s vflip-aware convention (see
+/// [`scene_space_quad`]): text lands `origin.y` rows from the **top** of the
+/// scene, the opposite mirror of the image-layer convention — exactly the
+/// reference's deliberate CImage/CText asymmetry (`CText.cpp:407-419`).
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn build_text(
@@ -393,21 +394,38 @@ pub fn draw_text(
     rp.draw(0..4, 0..1);
 }
 
-/// A centered Y-up scene-space quad (TL, BL, TR, BR triangle strip) for a layer
-/// of pixel size `sx × sy` centered at JSON Y-down `origin` (docs §7.1 geometry,
-/// reused for the text placeholder).
+/// The **text** scene-space quad (TL, BL, TR, BR triangle strip) for a glyph
+/// block of pixel size `sx × sy` at text `origin` — `CText`'s vflip-aware
+/// placement (`CText.cpp:407-419` + `uploadQuadVertices`, `CText.cpp:341-353`),
+/// mapped into kirie's scene space.
+///
+/// The reference composites in a Y-mirrored GL space and presents the frame
+/// vertically flipped (`WaylandOutput.cpp:34` `renderVFlip = true`); kirie
+/// composites in the mirrored (Y-up) space and presents unflipped (see the
+/// image `scene_space_quad` note in `renderer.rs`), so every reference Y maps
+/// through `y → -y`:
+///
+/// * center — reference `gl_origin.y = origin.y - scene_h/2`
+///   (`CText.cpp:416-419`, **not** the CImage-style `scene_h/2 - origin.y`)
+///   ⇒ kirie `cy = scene_h/2 - origin.y`. On screen the text sits `origin.y`
+///   rows from the **top** — text origins are Y-down/top-left, the opposite
+///   mirror of image layers (whose origins are Y-up; both mirrors verified
+///   against the presented oracle frame).
+/// * orientation — the reference puts glyph-top (`uv.v = 0`, FT's top row) on
+///   the quad's `-hy` edge (`CText.cpp:345-351`) ⇒ kirie's `+hh` (top) edge,
+///   keeping glyphs upright. The caller's UV order (TL `v=0` … BR `v=1`)
+///   pairs with this vertex order.
 fn scene_space_quad(ox: f32, oy: f32, sx: f32, sy: f32, scene: (u32, u32)) -> [[f32; 3]; 4] {
     let (sw, sh) = (scene.0 as f32, scene.1 as f32);
     let (hw, hh) = (sx / 2.0, sy / 2.0);
-    let left = ox - hw - sw / 2.0;
-    let right = ox + hw - sw / 2.0;
-    let top = sh / 2.0 - (oy - hh);
-    let bottom = sh / 2.0 - (oy + hh);
+    // Mirror of CText.cpp:416-419: `(origin.x - w/2, -(origin.y - h/2))`.
+    let cx = ox - sw / 2.0;
+    let cy = sh / 2.0 - oy;
     [
-        [left, top, 0.0],
-        [left, bottom, 0.0],
-        [right, top, 0.0],
-        [right, bottom, 0.0],
+        [cx - hw, cy + hh, 0.0],
+        [cx - hw, cy - hh, 0.0],
+        [cx + hw, cy + hh, 0.0],
+        [cx + hw, cy - hh, 0.0],
     ]
 }
 
@@ -439,3 +457,51 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(u.color.rgb, u.color.a * coverage);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_quad_matches_ctext_vflip_convention() {
+        // CText.cpp:407-419: text center is `origin - scene/2` in reference GL
+        // space; kirie's Y-mirror makes that `(ox - sw/2, sh/2 - oy)`. A text
+        // at JSON origin (100, 100) in a 1920x1080 scene sits 100 rows from
+        // the scene TOP (Y-down text origin), i.e. kirie center-y = +440.
+        let q = scene_space_quad(100.0, 100.0, 200.0, 50.0, (1920, 1080));
+        let cx = (q[0][0] + q[3][0]) / 2.0;
+        let cy = (q[0][1] + q[3][1]) / 2.0;
+        assert_eq!([cx, cy], [100.0 - 960.0, 540.0 - 100.0]);
+        // Corner layout TL, BL, TR, BR at the scaled half-extents.
+        assert_eq!(q[0], [-960.0, 465.0, 0.0]);
+        assert_eq!(q[1], [-960.0, 415.0, 0.0]);
+        assert_eq!(q[2], [-760.0, 465.0, 0.0]);
+        assert_eq!(q[3], [-760.0, 415.0, 0.0]);
+    }
+
+    #[test]
+    fn text_and_image_conventions_are_deliberate_mirrors() {
+        // The reference places text at `origin.y - h/2` but images at
+        // `h/2 - origin.y` (CText.cpp:414-415 "not the CImage-style") — text
+        // origins are Y-down, image origins Y-up. Guard the asymmetry: for the
+        // same off-center origin the text center-y must be the NEGATED image
+        // center-y (`renderer.rs::scene_space_quad`: `cy = oy - sh/2`).
+        let oy = 470.0;
+        let q = scene_space_quad(0.0, oy, 10.0, 10.0, (1920, 1080));
+        let text_cy = (q[0][1] + q[1][1]) / 2.0;
+        let image_cy = oy - 540.0;
+        assert_eq!(text_cy, -image_cy);
+    }
+
+    #[test]
+    fn glyph_top_lands_on_the_up_edge() {
+        // CText.cpp:345-351: uv.v = 0 (FreeType's top glyph row) lives on the
+        // reference quad's -hy edge; mirrored into kirie's Y-up scene space
+        // that is the +hh (screen-top) edge. The build_text UV order pairs
+        // v=0 with vertices 0 and 2 — they must be the higher-Y pair, or the
+        // glyphs render upside down.
+        let q = scene_space_quad(0.0, 0.0, 100.0, 40.0, (1920, 1080));
+        assert!(q[0][1] > q[1][1], "TL (v=0) above BL (v=1)");
+        assert!(q[2][1] > q[3][1], "TR (v=0) above BR (v=1)");
+    }
+}
