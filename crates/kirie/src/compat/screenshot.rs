@@ -381,13 +381,13 @@ pub fn capture(
         }
         #[cfg(feature = "web-cef")]
         Wallpaper::Web { dir, file } => {
-            use kirie_web::{WebBackend, WebRenderer, WebSize, cef::CefBackend};
+            use kirie_web::{WebBackend, WebRenderer, WebSize, hosted::HostedBackend};
             let url = super::resolve::web_entry_url(dir, file);
             let size = WebSize {
                 width: capture_size.width,
                 height: capture_size.height,
             };
-            let backend = <CefBackend as WebBackend>::new(&url, size)
+            let backend = <HostedBackend as WebBackend>::new(&url, size)
                 .map_err(|e| anyhow!("starting web backend for {url}: {e}"))?;
             Box::new(WebRenderer::new(&render_target, Box::new(backend)))
         }

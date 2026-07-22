@@ -22,7 +22,7 @@ portable = ["kirie-video/static-ffmpeg", "kirie-render/static-shaderc"]
 # downloads + links libcef. This is the backend that composites through kirie's
 # wgpu presentation layer (a `kirie_platform::Renderer` blitting CEF's OSR
 # frames), so it also powers `--screenshot`.
-web-cef = ["dep:kirie-web", "kirie-web/cef"]
+web-cef = ["dep:kirie-web", "kirie-web/host"]
 # wry + system webkit2gtk-4.1 native-surface backend. `kirie-web/webview` links
 # `webkit2gtk-4.1`/`libsoup-3.0` via pkg-config at COMPILE time, so this variant
 # only builds on a box with those -dev packages installed.

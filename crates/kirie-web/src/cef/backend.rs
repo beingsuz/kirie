@@ -309,6 +309,10 @@ impl WebBackend for CefBackend {
                     if let Some(thread) = mgr.thread.take() {
                         let _ = thread.join();
                     }
+                    // The browser runtime just released its heaps — return
+                    // them to the kernel and page the idle library out.
+                    kirie_bake::trim_heap();
+                    kirie_bake::pageout_cold_libs();
                 });
                 *teardown_lock() = Some(handle);
             }
@@ -450,7 +454,6 @@ fn cef_thread_main(config: ThreadConfig) {
         // Pump CEF once; every browser's OnPaint fires here on this thread.
         do_message_loop_work();
         settle = settle.saturating_sub(1);
-        settle = settle.saturating_sub(1);
 
         // Pace to the target frame rate.
         if let Some(rem) = frame_dt.checked_sub(frame_start.elapsed()) {
@@ -458,16 +461,32 @@ fn cef_thread_main(config: ThreadConfig) {
         }
     }
 
-    // --- Shutdown (docs §3.5): close the survivors, let the async closes
-    // settle, then shut the context down.
+    // --- Shutdown (docs §3.5): close the survivors, then pump until every
+    // browser fired OnBeforeClose. `cef_shutdown` with a browser still alive
+    // hangs Chromium's thread teardown — the runtime (30+ threads, zygote
+    // subprocesses, V8 heaps: hundreds of MB) then outlives the web wallpaper.
+    // Bounded at 5s; a fixed 10-iteration settle was not a guarantee.
     for (_, entry) in registry.drain() {
         close_browser(entry.browser);
     }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while super::client::LIVE_BROWSERS.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && Instant::now() < deadline
+    {
+        do_message_loop_work();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A few extra iterations so post-close CEF tasks run before shutdown.
     for _ in 0..10 {
         do_message_loop_work();
         std::thread::sleep(Duration::from_millis(5));
     }
+    tracing::info!(
+        remaining = super::client::LIVE_BROWSERS.load(std::sync::atomic::Ordering::SeqCst),
+        "cef context shutting down"
+    );
     shutdown();
+    tracing::info!("cef context shut down; browser runtime released");
     // CEF has fully torn down (all its threads joined); the throwaway profile
     // dir can be reclaimed.
     let _ = std::fs::remove_dir_all(&cache_dir);

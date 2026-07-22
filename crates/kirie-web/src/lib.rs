@@ -34,6 +34,11 @@ pub mod shim;
 #[cfg(feature = "cef")]
 pub mod cef;
 
+/// Out-of-process web host client (feature `host`): spawns `kirie-webhost`,
+/// maps its frame shm, kills it on drop — full browser-runtime reclaim.
+#[cfg(feature = "host")]
+pub mod hosted;
+
 /// The wry + system-`webkit2gtk` native-surface backend (feature `webview`).
 ///
 /// **Status: permanent fallback, not a [`WebBackend`] — won't-fix upstream.**

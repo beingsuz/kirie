@@ -51,7 +51,7 @@ use crate::compat::resolve::{self, ClassifyError, Wallpaper};
 use crate::compat::{list_props, screenshot, signals};
 
 #[cfg(feature = "web-cef")]
-use kirie_web::{WebBackend, WebRenderer, WebSize, cef::CefBackend};
+use kirie_web::{WebBackend, WebRenderer, WebSize, hosted::HostedBackend};
 
 /// `--render-scale`, stored once at launch for every scene build (including
 /// live swaps/preloads, which share the same engine invocation). f32 bits in an
@@ -941,7 +941,7 @@ fn build_web(
         width: 1920,
         height: 1080,
     };
-    match <CefBackend as WebBackend>::new(url, size) {
+    match <HostedBackend as WebBackend>::new(url, size) {
         Ok(mut backend) => {
             if silent {
                 backend.set_muted(true);

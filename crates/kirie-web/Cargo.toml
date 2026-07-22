@@ -16,7 +16,10 @@ default = []
 # Chromium Embedded Framework off-screen-rendering backend. `cef` and
 # `cef-dll-sys` are HEAVY (download + cmake-build of libcef); gated so the
 # default build never touches them.
-cef = ["dep:cef", "dep:cef-dll-sys"]
+cef = ["dep:cef", "dep:cef-dll-sys", "dep:memmap2", "dep:tracing-subscriber", "dep:libc", "host"]
+# Out-of-process web host CLIENT: no browser deps at all — spawns the
+# `kirie-webhost` binary and reads its shared-memory frames.
+host = []
 # wry + system webkit2gtk-4.1 native-surface backend. NOTE: this is a
 # native-surface fallback only — wry/webkit2gtk has no off-screen rendering
 # path (upstream limitation, won't-fix; see src/webview/mod.rs), so it can
@@ -27,6 +30,10 @@ cef = ["dep:cef", "dep:cef-dll-sys"]
 webview = ["dep:wry", "dep:raw-window-handle"]
 
 [dependencies]
+memmap2 = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+kirie-bake = { path = "../kirie-bake" }
 kirie-platform = { path = "../kirie-platform" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -57,3 +64,8 @@ required-features = ["cef"]
 [dev-dependencies]
 # PNG encoding for the CEF OSR smoke test (tests/osr_smoke.rs, cef-only).
 image = { workspace = true }
+
+[[bin]]
+name = "kirie-webhost"
+path = "src/bin/kirie-webhost.rs"
+required-features = ["cef"]

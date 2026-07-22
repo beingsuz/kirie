@@ -9,11 +9,12 @@
 //! never blocks on the GPU and vice-versa (SPEC §V4).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use cef::{
-    Browser, Client, ImplClient, ImplRenderHandler, PaintElementType, Rect, RenderHandler, WrapClient,
-    WrapRenderHandler, rc::Rc, wrap_client, wrap_render_handler,
+    Browser, Client, ImplClient, ImplLifeSpanHandler, ImplRenderHandler, LifeSpanHandler,
+    PaintElementType, Rect, RenderHandler, WrapClient, WrapLifeSpanHandler, WrapRenderHandler,
+    rc::Rc, wrap_client, wrap_life_span_handler, wrap_render_handler,
 };
 
 use crate::backend::{FrameBuffer, FrameSlot, PixelFormat};
@@ -107,16 +108,43 @@ wrap_render_handler! {
     }
 }
 
-// The OSR browser client — supplies only the render handler. Private for the
+/// Browsers created and not yet fully closed (`OnAfterCreated` →
+/// `OnBeforeClose`). `cef_shutdown` with a browser still alive hangs
+/// Chromium's thread teardown — the whole runtime (threads, zygotes, V8
+/// heaps) then survives a web→scene switch. The pump drains to zero before
+/// shutting the context down.
+pub static LIVE_BROWSERS: AtomicUsize = AtomicUsize::new(0);
+
+// Lifespan tracker: counts real browser lifetimes for the shutdown drain.
+wrap_life_span_handler! {
+    struct KirieLifeSpan;
+
+    impl LifeSpanHandler {
+        fn on_after_created(&self, _browser: Option<&mut Browser>) {
+            LIVE_BROWSERS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            LIVE_BROWSERS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// The OSR browser client — render handler + lifespan tracker. Private for the
 // same macro-attribute reason; the public entry point is `make_client`.
 wrap_client! {
     struct KirieClient {
         handler: RenderHandler,
+        life: LifeSpanHandler,
     }
 
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
             Some(self.handler.clone())
+        }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(self.life.clone())
         }
     }
 }
@@ -125,5 +153,5 @@ wrap_client! {
 #[must_use]
 pub fn make_client(slot: FrameSlot, size: Arc<SharedSize>) -> Client {
     let handler = KirieRenderHandler::new(slot, size);
-    KirieClient::new(handler)
+    KirieClient::new(handler, KirieLifeSpan::new())
 }

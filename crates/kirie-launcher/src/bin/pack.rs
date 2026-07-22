@@ -44,6 +44,7 @@ const STUB: &str = "kirie-launcher";
 const RUNTIME_FILES: &[&str] = &[
     "kirie",
     "kirie-cef-helper",
+    "kirie-webhost",
     "libcef.so",
     "libEGL.so",
     "libGLESv2.so",
@@ -174,7 +175,7 @@ fn strip_stage(stage: &Path) {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
         let is_bin_or_lib =
-            name == "kirie" || name == "kirie-cef-helper" || name.contains(".so");
+            name == "kirie" || name == "kirie-cef-helper" || name == "kirie-webhost" || name.contains(".so");
         if !is_bin_or_lib {
             continue;
         }
