@@ -37,6 +37,7 @@ kirie-formats = { workspace = true }
 # (root manifest is frozen — same convention kirie-render/kirie-video use).
 kirie-platform = { path = "../kirie-platform" }
 kirie-render = { path = "../kirie-render" }
+kirie-bake = { path = "../kirie-bake" }
 kirie-video = { path = "../kirie-video" }
 kirie-ipc = { path = "../kirie-ipc" }
 kirie-audio = { path = "../kirie-audio" }

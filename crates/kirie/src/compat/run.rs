@@ -1038,6 +1038,17 @@ fn build_for_spec(
     properties: &[(String, String)],
     automute_controls: &Arc<Mutex<Vec<VideoControl>>>,
 ) -> Box<dyn Renderer + Send> {
+    // Builds allocate large transient buffers (texture decode, shader
+    // translation) that glibc retains after free — return them to the kernel
+    // once the renderer is up so standby RSS tracks live assets, not the
+    // build peak.
+    struct TrimOnExit;
+    impl Drop for TrimOnExit {
+        fn drop(&mut self) {
+            kirie_bake::trim_heap();
+        }
+    }
+    let _trim = TrimOnExit;
     match spec {
         RunSpec::Video { media, scaling } => {
             let options = VideoOptions {

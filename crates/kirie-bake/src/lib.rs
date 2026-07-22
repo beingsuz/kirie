@@ -39,6 +39,22 @@ pub mod key;
 
 pub use baker::{BackgroundBaker, BakeOutcome, BakerConfig, ContentFn, PauseFn, SourceFn, never_pause};
 
+/// Return freed heap pages to the kernel (`malloc_trim(0)`).
+///
+/// Wallpaper builds allocate large transient buffers (texture decode, shader
+/// translation, scene JSON) that glibc's arenas retain after free — tens of
+/// MB of dead RSS per build. Callers invoke this once after a build/swap
+/// completes; it is a no-op-safe hint, never required for correctness. Lives
+/// here for the same §V2 reason as [`map_readonly`] (the one crate allowed
+/// `unsafe`; `malloc_trim` is a foreign call).
+pub fn trim_heap() {
+    // SAFETY: malloc_trim(0) only releases free arena memory back to the OS;
+    // it takes no pointers and cannot invalidate live allocations.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Memory-map a file read-only, boxed as opaque bytes.
 ///
 /// This lives here because kirie-bake is the one crate with the §V2 `unsafe`
