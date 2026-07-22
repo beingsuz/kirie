@@ -39,6 +39,20 @@ pub mod key;
 
 pub use baker::{BackgroundBaker, BakeOutcome, BakerConfig, ContentFn, PauseFn, SourceFn, never_pause};
 
+/// Cap glibc's malloc arena count (`mallopt(M_ARENA_MAX, n)`).
+///
+/// Every wallpaper build runs on a fresh worker thread; glibc hands each new
+/// thread a (possibly new) arena, up to 8×cores — and [`trim_heap`] only
+/// reliably releases the main arena. Capping the count early keeps transient
+/// build allocations in a couple of arenas the trims actually reach, so RSS
+/// doesn't ratchet up across wallpaper switches. Call once at startup.
+pub fn limit_malloc_arenas(n: i32) {
+    // SAFETY: mallopt sets an allocator tuning knob; no pointers involved.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, n.max(1));
+    }
+}
+
 /// Return freed heap pages to the kernel (`malloc_trim(0)`).
 ///
 /// Wallpaper builds allocate large transient buffers (texture decode, shader

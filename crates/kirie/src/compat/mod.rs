@@ -26,6 +26,11 @@ use args::ParseError;
 /// Exit codes follow doc §5: `0` for `--help` and successful runs/clean stops,
 /// `1` for any parse/startup fatal or abnormal termination.
 pub fn run(argv: &[OsString]) -> ExitCode {
+    // Keep glibc to two malloc arenas so per-swap build threads reuse them and
+    // `trim_heap` after each build/drop actually returns the pages — without
+    // this, every fresh worker thread can land in a new arena the trims never
+    // reach and RSS ratchets across wallpaper switches.
+    kirie_bake::limit_malloc_arenas(2);
     init_tracing();
     let argv0 = argv
         .first()
