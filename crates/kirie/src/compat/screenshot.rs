@@ -244,6 +244,7 @@ impl SceneSettle {
 struct Headless {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    adapter: wgpu::Adapter,
 }
 
 impl Headless {
@@ -263,10 +264,15 @@ impl Headless {
                     let (device, queue) =
                         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                             label: Some("kirie-screenshot"),
+                            required_features: adapter.features()
+                                & wgpu::Features::PIPELINE_CACHE,
                             ..wgpu::DeviceDescriptor::default()
                         }))
                         .context("request headless wgpu device")?;
-                    return Ok(Self { device, queue });
+                    // Warm/persist the driver pipeline cache here too, so
+                    // `--screenshot` runs share the engine's compiled binaries.
+                    kirie_platform::attach_pipeline_cache(&device, &adapter);
+                    return Ok(Self { device, queue, adapter });
                 }
                 Err(err) => last = Some(anyhow!("no adapter on {backends:?}: {err}")),
             }
@@ -457,6 +463,7 @@ pub fn capture(
         std::thread::sleep(Duration::from_millis(16));
     }
 
+    kirie_platform::persist_pipeline_cache(&gpu.adapter);
     write_image(out_path, capture_size.width, capture_size.height, &pixels)?;
     if !captured_nonblack {
         tracing::warn!(

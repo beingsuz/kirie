@@ -389,6 +389,9 @@ impl PlatformState {
         // refault at the next build.
         kirie_bake::trim_heap();
         kirie_bake::pageout_cold_libs();
+        if let Some(gpu) = &self.gpu {
+            crate::gpu::persist_pipeline_cache(&gpu.adapter);
+        }
         tracing::info!(output = %ctx.name, "wallpaper swapped in");
     }
 
@@ -686,10 +689,13 @@ impl PlatformState {
                 "first frame presented"
             );
             // Initial build settled: drop the build-burst pages (glibc arenas
-            // + shader-compiler/raytracing driver libs) from RSS. Swaps do the
-            // same in install_renderer.
+            // + shader-compiler/raytracing driver libs) from RSS and persist
+            // the driver pipeline cache. Swaps do the same in install_renderer.
             kirie_bake::trim_heap();
             kirie_bake::pageout_cold_libs();
+            if let Some(gpu) = &self.gpu {
+                crate::gpu::persist_pipeline_cache(&gpu.adapter);
+            }
         }
     }
 

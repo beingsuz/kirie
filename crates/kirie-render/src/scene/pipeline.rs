@@ -322,7 +322,7 @@ pub fn build_pass(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: kirie_platform::pipeline_cache(),
     });
 
     Ok(BuiltPass {
@@ -534,7 +534,7 @@ pub fn build_model_pass(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: kirie_platform::pipeline_cache(),
     });
 
     Ok(BuiltPass {

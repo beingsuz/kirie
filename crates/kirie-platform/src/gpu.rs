@@ -1,10 +1,13 @@
 //! wgpu instance/adapter/device bring-up and raw-handle surface creation.
 //!
-//! This module contains the **only** `unsafe` in the crate (SPEC V2:
-//! kirie-platform may use unsafe for raw-window-handle surface creation
-//! only), isolated in [`create_wgpu_surface`].
+//! `unsafe` in this crate (SPEC V2 note): raw-window-handle surface creation
+//! in [`create_wgpu_surface`], and the driver pipeline-cache constructor in
+//! [`attach_pipeline_cache`] (`create_pipeline_cache` is `unsafe` because it
+//! trusts the blob; ours comes from our own cache file and wgpu validates the
+//! header + falls back on mismatch).
 
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -22,6 +25,76 @@ pub(crate) struct Gpu {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+}
+
+/// The process-wide driver pipeline cache, set at GPU bring-up. kirie-render's
+/// pipeline builders read it (they already depend on this crate), so every
+/// `create_render_pipeline` reuses driver-compiled binaries across launches —
+/// the ~340ms/launch SPIR-V→ISA recompile disappears on warm starts.
+static SHARED_PIPELINE_CACHE: OnceLock<wgpu::PipelineCache> = OnceLock::new();
+
+/// The shared driver pipeline cache, if the adapter supports one.
+#[must_use]
+pub fn pipeline_cache() -> Option<&'static wgpu::PipelineCache> {
+    SHARED_PIPELINE_CACHE.get()
+}
+
+/// On-disk blob path for `adapter`'s pipeline cache.
+fn pipeline_cache_file(adapter: &wgpu::Adapter) -> Option<std::path::PathBuf> {
+    let info = adapter.get_info();
+    let key: String = format!("{}-{}-{}", info.name, info.driver, info.backend)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("kirie").join("pipelines").join(format!("{key}.bin")))
+}
+
+/// Create the driver pipeline cache for `device` (loading last session's blob)
+/// and publish it as the process-wide cache. Idempotent; no-op when the
+/// adapter lacks `PIPELINE_CACHE`.
+#[allow(unsafe_code)]
+pub fn attach_pipeline_cache(device: &wgpu::Device, adapter: &wgpu::Adapter) {
+    if !device.features().contains(wgpu::Features::PIPELINE_CACHE)
+        || SHARED_PIPELINE_CACHE.get().is_some()
+    {
+        return;
+    }
+    let data = pipeline_cache_file(adapter).and_then(|p| std::fs::read(p).ok());
+    // SAFETY: the blob is our own previous `get_data()` output for this
+    // adapter; wgpu/Vulkan validate the cache header and fall back to an
+    // empty cache on any mismatch (`fallback: true`).
+    let cache = unsafe {
+        device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            label: Some("kirie-pipeline-cache"),
+            data: data.as_deref(),
+            fallback: true,
+        })
+    };
+    let loaded = data.is_some();
+    if SHARED_PIPELINE_CACHE.set(cache).is_ok() {
+        tracing::info!(warm = loaded, "driver pipeline cache attached");
+    }
+}
+
+/// Persist the shared pipeline cache blob for `adapter` (atomic replace).
+/// Cheap enough to call after every wallpaper build/swap.
+pub fn persist_pipeline_cache(adapter: &wgpu::Adapter) {
+    let Some(cache) = SHARED_PIPELINE_CACHE.get() else {
+        return;
+    };
+    let Some(data) = cache.get_data() else { return };
+    let Some(path) = pipeline_cache_file(adapter) else {
+        return;
+    };
+    let Some(dir) = path.parent() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &data).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 impl Gpu {
@@ -67,8 +140,13 @@ impl Gpu {
                     let (device, queue) =
                         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                             label: Some("kirie-platform"),
+                            // Driver pipeline cache (Vulkan): reuse compiled
+                            // pipeline binaries across launches when supported.
+                            required_features: adapter.features()
+                                & wgpu::Features::PIPELINE_CACHE,
                             ..wgpu::DeviceDescriptor::default()
                         }))?;
+                    attach_pipeline_cache(&device, &adapter);
                     return Ok((
                         Self {
                             instance,
