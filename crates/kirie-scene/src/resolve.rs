@@ -183,12 +183,15 @@ fn resolve_material(material: &mut Material, bag: &PropertyBag) {
 }
 
 /// A source of asset-file bytes by relative path (pkg entry, loose dir, …).
-pub trait AssetSource {
+pub trait AssetSource: Sync {
     /// Load the raw bytes of `path`, or `None` if it is not available.
+    ///
+    /// `Sync` supertrait: the renderer's object-build loop shares one source
+    /// across worker threads (parallel texture/shader loads).
     fn load(&self, path: &str) -> Option<Vec<u8>>;
 }
 
-impl<F: Fn(&str) -> Option<Vec<u8>>> AssetSource for F {
+impl<F: Fn(&str) -> Option<Vec<u8>> + Sync> AssetSource for F {
     fn load(&self, path: &str) -> Option<Vec<u8>> {
         self(path)
     }

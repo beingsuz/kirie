@@ -340,6 +340,13 @@ pub fn set_cache_dir(dir: Option<std::path::PathBuf>) {
     CACHE_DIR_OVERRIDE.with(|c| *c.borrow_mut() = dir);
 }
 
+/// The current thread's cache-dir override, if any — so a parallel build can
+/// propagate the loading thread's per-wallpaper dir to its workers.
+#[must_use]
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    CACHE_DIR_OVERRIDE.with(|c| c.borrow().clone())
+}
+
 /// The active shader-cache directory: the per-build override if set, else
 /// `$XDG_CACHE_HOME/kirie/shaders` (or `$HOME/.cache/kirie/shaders`). `None`
 /// disables the cache.

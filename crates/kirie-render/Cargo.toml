@@ -12,6 +12,7 @@ description = "Wallpaper renderers: still-image + animated-gif (.tex TEXS atlase
 static-shaderc = ["kirie-shader/static-shaderc"]
 
 [dependencies]
+rayon = { workspace = true }
 kirie-formats = { workspace = true }
 # Sibling workspace crates, not listed in [workspace.dependencies]; path deps
 # (root manifest is frozen — reported in the task notes).

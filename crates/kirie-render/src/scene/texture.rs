@@ -106,15 +106,22 @@ impl AtlasTexture {
 pub struct TextureRegistry {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    cache: HashMap<String, Option<std::sync::Arc<GpuTexture>>>,
+    /// Name → per-entry once-cell. Shared-`&self` so the object-build loop can
+    /// run in parallel: the brief map lock only hands out the cell; the decode
+    /// + upload happen inside `OnceLock::get_or_init`, so two threads wanting
+    /// the SAME texture dedupe (one loads, the other waits) while different
+    /// textures load fully concurrently.
+    cache: std::sync::Mutex<
+        HashMap<String, std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<GpuTexture>>>>>,
+    >,
     white: std::sync::Arc<GpuTexture>,
     /// Video-backed textures kept playing; the renderer takes these after build
     /// ([`Self::take_videos`]) and streams frames per render tick.
-    videos: Vec<VideoTexture>,
+    videos: std::sync::Mutex<Vec<VideoTexture>>,
     /// Animated atlases by texture name; objects look up their layer's atlas
     /// ([`Self::atlas_for`]) and the renderer takes the list after build
     /// ([`Self::take_atlases`]) to advance pages per render tick.
-    atlases: HashMap<String, std::sync::Arc<AtlasTexture>>,
+    atlases: std::sync::Mutex<HashMap<String, std::sync::Arc<AtlasTexture>>>,
 }
 
 impl TextureRegistry {
@@ -143,9 +150,9 @@ impl TextureRegistry {
         TextureRegistry {
             device: device.clone(),
             queue: queue.clone(),
-            cache: HashMap::new(),
-            videos: Vec::new(),
-            atlases: HashMap::new(),
+            cache: std::sync::Mutex::new(HashMap::new()),
+            videos: std::sync::Mutex::new(Vec::new()),
+            atlases: std::sync::Mutex::new(HashMap::new()),
             white,
         }
     }
@@ -159,13 +166,17 @@ impl TextureRegistry {
     /// Resolve a bare texture `name` to an uploaded texture, loading it from
     /// `source` on first use. Returns the white fallback when the file is
     /// absent or fails to decode (never an error, docs §8.2 fallback chain).
-    pub fn get(&mut self, name: &str, source: &dyn AssetSource) -> std::sync::Arc<GpuTexture> {
-        if let Some(entry) = self.cache.get(name) {
-            return entry.clone().unwrap_or_else(|| self.white.clone());
-        }
-        let loaded = self.load(name, source);
-        self.cache.insert(name.to_string(), loaded.clone());
-        loaded.unwrap_or_else(|| self.white.clone())
+    pub fn get(&self, name: &str, source: &dyn AssetSource) -> std::sync::Arc<GpuTexture> {
+        let slot = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        slot.get_or_init(|| self.load(name, source))
+            .clone()
+            .unwrap_or_else(|| self.white.clone())
     }
 
     /// Resolve a **particle sprite** texture, cropped to spritesheet frame 0.
@@ -179,18 +190,20 @@ impl TextureRegistry {
     /// uploading just frame 0's sub-rect is the faithful still. A non-atlas or
     /// rotated-frame texture returns `None`, and the caller falls back to the
     /// ordinary [`Self::get`] upload.
-    pub fn get_sprite_frame0(&mut self, name: &str, source: &dyn AssetSource) -> std::sync::Arc<GpuTexture> {
+    pub fn get_sprite_frame0(&self, name: &str, source: &dyn AssetSource) -> std::sync::Arc<GpuTexture> {
         let key = format!("\u{0}f0:{name}");
-        if let Some(entry) = self.cache.get(&key) {
-            return entry.clone().unwrap_or_else(|| self.white.clone());
+        let slot = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .clone();
+        match slot.get_or_init(|| self.load_frame0(name, source)) {
+            Some(t) => t.clone(),
+            // Not an atlas (or undecodable): reuse the ordinary upload path.
+            None => self.get(name, source),
         }
-        let cropped = self.load_frame0(name, source);
-        if let Some(t) = cropped {
-            self.cache.insert(key, Some(t.clone()));
-            return t;
-        }
-        // Not an atlas (or undecodable): reuse the ordinary upload path.
-        self.get(name, source)
     }
 
     /// Decode `name`'s `.tex` and, if it is a multi-frame atlas with an
@@ -238,7 +251,7 @@ impl TextureRegistry {
         Some(std::sync::Arc::new(gpu))
     }
 
-    fn load(&mut self, name: &str, source: &dyn AssetSource) -> Option<std::sync::Arc<GpuTexture>> {
+    fn load(&self, name: &str, source: &dyn AssetSource) -> Option<std::sync::Arc<GpuTexture>> {
         let path = format!("materials/{name}.tex");
         let bytes = source.load(&path)?;
         let content = match ImageContent::from_tex_bytes(&bytes) {
@@ -290,7 +303,7 @@ impl TextureRegistry {
     /// pages whose dimensions differ from page 0 cannot stream into the one
     /// bound texture, so such content stays a static frame 0 (SPEC.md §V9 —
     /// malformed input degrades, never breaks).
-    fn register_atlas(&mut self, name: &str, content: ImageContent, gpu: &std::sync::Arc<GpuTexture>) {
+    fn register_atlas(&self, name: &str, content: ImageContent, gpu: &std::sync::Arc<GpuTexture>) {
         let Some(multi_page) = atlas_animates(&content) else {
             if content.frames.len() > 1 {
                 tracing::debug!(texture = %name, "animated .tex not streamable; keeping static frame 0");
@@ -298,7 +311,7 @@ impl TextureRegistry {
             return;
         };
         let schedule = content.schedule();
-        self.atlases.insert(
+        self.atlases.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
             name.to_string(),
             std::sync::Arc::new(AtlasTexture {
                 frames: content.frames,
@@ -315,7 +328,11 @@ impl TextureRegistry {
     /// `g_Texture0Translation`/`g_Texture0Rotation` builtins (docs §8.3).
     #[must_use]
     pub fn atlas_for(&self, name: &str) -> Option<std::sync::Arc<AtlasTexture>> {
-        self.atlases.get(name).cloned()
+        self.atlases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
     }
 
     /// Decode the **first frame** of an MP4 video texture and upload it as a
@@ -325,7 +342,7 @@ impl TextureRegistry {
     /// full-screen white sheet (the dominant cause of "all-white" scene
     /// renders in the corpus). Any failure returns `None` → white fallback, so
     /// this branch can never render worse than before.
-    fn load_video_first_frame(&mut self, name: &str, tex_bytes: &[u8]) -> Option<std::sync::Arc<GpuTexture>> {
+    fn load_video_first_frame(&self, name: &str, tex_bytes: &[u8]) -> Option<std::sync::Arc<GpuTexture>> {
         use std::time::Duration;
 
         let tex = kirie_formats::tex::Tex::parse(tex_bytes).ok()?;
@@ -383,7 +400,7 @@ impl TextureRegistry {
         // Keep the player: the renderer streams later frames into this same
         // texture every tick (the reference PLAYS video .tex, docs §10).
         if let Some(player) = player {
-            self.videos.push(VideoTexture {
+            self.videos.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(VideoTexture {
                 player,
                 gpu: gpu.clone(),
                 size: (frame.width, frame.height),
@@ -395,14 +412,20 @@ impl TextureRegistry {
     /// Hand the live video textures to the renderer (called once after build;
     /// the registry is discarded afterwards).
     pub fn take_videos(&mut self) -> Vec<VideoTexture> {
-        std::mem::take(&mut self.videos)
+        std::mem::take(
+            &mut *self.videos.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Hand the animated atlases to the renderer (called once after build; the
     /// registry is discarded afterwards). The renderer advances each atlas per
     /// render tick and streams multi-page frames into the bound texture.
     pub fn take_atlases(&mut self) -> Vec<std::sync::Arc<AtlasTexture>> {
-        std::mem::take(&mut self.atlases).into_values().collect()
+        std::mem::take(
+            &mut *self.atlases.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_values()
+        .collect()
     }
 }
 

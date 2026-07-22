@@ -552,7 +552,7 @@ impl SceneRenderer {
             std::collections::HashMap::new();
         // Build-scoped reflection interning (dropped with `new`; the shared
         // tables live on inside the passes that reference them).
-        let mut param_cache = ParamCache::new();
+        let param_cache = std::sync::Mutex::new(ParamCache::new());
         for &oi in &order {
             let object = &scene.objects[oi];
             if !donor_ids.contains(&object.base.id) {
@@ -568,13 +568,13 @@ impl SceneRenderer {
                     &screen_mvp,
                     source,
                     &resolver,
-                    &mut registry,
+                    &registry,
                     &fbo_sampler,
                     &scene_snapshot,
                     world,
                     true,
                     &cross,
-                    &mut param_cache,
+                    &param_cache,
                     rs,
                 ) {
                     if let Some(front) = obj.final_front
@@ -589,16 +589,36 @@ impl SceneRenderer {
             }
         }
 
-        for &oi in &order {
-            let object = &scene.objects[oi];
-            if let Some(obj) = donor_built.remove(&oi) {
-                items.push(SceneItem::Image(Box::new(obj)));
-                continue;
-            }
-            match &object.kind {
-                ObjectKind::Image(image) => {
+        // Non-donor image objects build in PARALLEL: every input is shared-`&`
+        // (the texture registry dedupes per-name via once-cells, the param
+        // cache is a mutex, wgpu resource creation is internally synced, the
+        // shader unit/module caches are on-disk atomic). Donors already built
+        // above, so `cross` is read-only here. Text/particle/model builds stay
+        // sequential in the assembly loop below (cosmic-text and the sims are
+        // cheap and not thread-safe). Ordering is preserved by indexing.
+        let shader_cache_dir = kirie_shader::translate::cache_dir();
+        let parallel_built: HashMap<usize, ObjectGpu> = {
+            use rayon::prelude::*;
+            let image_indices: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|oi| {
+                    !donor_built.contains_key(oi)
+                        && matches!(&scene.objects[*oi].kind, ObjectKind::Image(_))
+                })
+                .collect();
+            image_indices
+                .into_par_iter()
+                .filter_map(|oi| {
+                    // Per-worker shader-cache dir (thread-local; load.rs set it
+                    // on the loading thread only).
+                    kirie_shader::translate::set_cache_dir(shader_cache_dir.clone());
+                    let object = &scene.objects[oi];
+                    let ObjectKind::Image(image) = &object.kind else {
+                        return None;
+                    };
                     let world = world_xf(object.base.id, &local_xf);
-                    if let Some(obj) = build_object(
+                    build_object(
                         device,
                         object,
                         image,
@@ -606,15 +626,30 @@ impl SceneRenderer {
                         &screen_mvp,
                         source,
                         &resolver,
-                        &mut registry,
+                        &registry,
                         &fbo_sampler,
                         &scene_snapshot,
                         world,
                         false,
                         &cross,
-                        &mut param_cache,
+                        &param_cache,
                         rs,
-                    ) {
+                    )
+                    .map(|obj| (oi, obj))
+                })
+                .collect()
+        };
+        let mut parallel_built = parallel_built;
+
+        for &oi in &order {
+            let object = &scene.objects[oi];
+            if let Some(obj) = donor_built.remove(&oi) {
+                items.push(SceneItem::Image(Box::new(obj)));
+                continue;
+            }
+            match &object.kind {
+                ObjectKind::Image(_) => {
+                    if let Some(obj) = parallel_built.remove(&oi) {
                         items.push(SceneItem::Image(Box::new(obj)));
                     }
                 }
@@ -972,13 +1007,13 @@ fn build_object(
     screen_mvp: &Mat4,
     source: &dyn AssetSource,
     resolver: &dyn IncludeResolver,
-    registry: &mut TextureRegistry,
+    registry: &TextureRegistry,
     fbo_sampler: &wgpu::Sampler,
     scene_snapshot: &Fbo,
     world: WorldXf,
     offscreen_donor: bool,
     cross: &std::collections::HashMap<String, wgpu::TextureView>,
-    param_cache: &mut ParamCache,
+    param_cache: &std::sync::Mutex<ParamCache>,
     fbo_scale: f32,
 ) -> Option<ObjectGpu> {
     // Every object plans + builds its full chain regardless of visibility —
@@ -1148,7 +1183,7 @@ fn build_object(
         ) {
             Ok(mut b) => {
                 let (params_vs, params_fs) = intern_params(
-                    param_cache,
+                    &mut param_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
                     &plan_pass.shader,
                     std::mem::take(&mut b.vs_params),
                     std::mem::take(&mut b.fs_params),
@@ -2701,7 +2736,7 @@ pub(super) fn is_scene_rt(name: &str) -> bool {
 fn base_layer_texture(
     image: &ImageObject,
     source: &dyn AssetSource,
-    registry: &mut TextureRegistry,
+    registry: &TextureRegistry,
 ) -> std::sync::Arc<super::texture::GpuTexture> {
     match base_layer_name(image) {
         Some(n) if !n.starts_with("_rt_") && !n.starts_with("_alias_") => registry.get(&n, source),
@@ -3019,7 +3054,7 @@ pub(super) fn build_bind_group(
     samplers: &[SamplerSlot],
     input_view: &wgpu::TextureView,
     input_sampler: &wgpu::Sampler,
-    registry: &mut TextureRegistry,
+    registry: &TextureRegistry,
     source: &dyn AssetSource,
     pass: &kirie_scene::material::Pass,
     scene: (&wgpu::TextureView, &wgpu::Sampler),
