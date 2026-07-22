@@ -161,12 +161,11 @@ fn main() {
         }
     }
 
-    // Hard exit backstop: if CEF's teardown wedges, the engine's kill covers
-    // us, but don't let a hang keep the GPU/audio alive meanwhile.
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(3));
-        std::process::exit(0);
-    });
-    drop(backend);
+    // Exit WITHOUT running CEF teardown: process isolation is the whole
+    // point — the kernel reclaims every page/thread, the zygotes exit on
+    // their broken IPC pipes, and CEF 149's in-process teardown reliably
+    // SIGSEGVs anyway (it left a coredump on every clean quit). `exit`
+    // skips the backend's Drop chain deliberately.
+    std::mem::forget(backend);
     std::process::exit(0);
 }
