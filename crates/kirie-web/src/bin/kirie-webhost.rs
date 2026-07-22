@@ -9,7 +9,7 @@
 //! guaranteed. See `kirie_web::hosted` for the protocol/layout.
 
 use std::io::BufRead;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::FromRawFd;
 use std::sync::mpsc::{TryRecvError, channel};
 use std::time::{Duration, Instant};
 

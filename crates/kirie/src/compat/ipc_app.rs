@@ -23,8 +23,8 @@ use kirie_platform::{CaptureFn, RenderCommand};
 use super::run::SwapCtx;
 use crossbeam_channel::{Receiver, Sender, select};
 use kirie_ipc::{
-    ClampMode as IpcClamp, Command, CommandOutcome, IpcEvent, ScalingMode as IpcScaling,
-    ScreenStatus, SetOption, StatusSnapshot,
+    ClampMode as IpcClamp, Command, CommandOutcome, IpcEvent, ScalingMode as IpcScaling, ScreenStatus,
+    SetOption, StatusSnapshot,
 };
 use kirie_video::{ScalingMode as VideoScaling, VideoControl};
 
@@ -298,11 +298,9 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
                         rebuild_current(state);
                     }
                 }
-                SetOption::DisableParallax(on) => {
-                    if on != super::run::disable_parallax() {
-                        super::run::set_disable_parallax(on);
-                        rebuild_current(state);
-                    }
+                SetOption::DisableParallax(on) if on != super::run::disable_parallax() => {
+                    super::run::set_disable_parallax(on);
+                    rebuild_current(state);
                 }
                 // noautomute/disablemouse/nofullscreenpause/audiodevice: ack
                 // only for now (follow-up: live audio-device re-init).
@@ -346,7 +344,10 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
                 state
                     .screens
                     .entry(screen)
-                    .or_insert_with(|| ScreenEntry { bg: None, control: None })
+                    .or_insert_with(|| ScreenEntry {
+                        bg: None,
+                        control: None,
+                    })
                     .bg = Some(path);
                 return CommandOutcome::Ok;
             }
@@ -364,7 +365,10 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
                 state
                     .screens
                     .entry(screen)
-                    .or_insert_with(|| ScreenEntry { bg: None, control: None })
+                    .or_insert_with(|| ScreenEntry {
+                        bg: None,
+                        control: None,
+                    })
                     .bg = Some(path);
                 return CommandOutcome::Ok;
             }
@@ -521,7 +525,8 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
                 return CommandOutcome::Error;
             };
             let capture: CaptureFn = Box::new(move |device, queue, renderer, size, format| {
-                if let Err(e) = super::screenshot::capture_live(device, queue, renderer, size, format, &path) {
+                if let Err(e) = super::screenshot::capture_live(device, queue, renderer, size, format, &path)
+                {
                     tracing::warn!(error = format!("{e:#}"), "socket screenshot failed");
                 }
             });

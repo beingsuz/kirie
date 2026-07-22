@@ -49,6 +49,9 @@ pub struct GpuTexture {
     pub real_size: [f32; 2],
 }
 
+/// One texture slot: filled at most once, shareable across build workers.
+type TextureCell = std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<GpuTexture>>>>;
+
 /// A name-keyed cache of uploaded pass textures plus the fallback white texture
 /// (docs §6, §8.2). One registry per scene build.
 /// A live video-backed `.tex`: the decode thread keeps producing frames and the
@@ -106,14 +109,12 @@ impl AtlasTexture {
 pub struct TextureRegistry {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Name → per-entry once-cell. Shared-`&self` so the object-build loop can
-    /// run in parallel: the brief map lock only hands out the cell; the decode
-    /// + upload happen inside `OnceLock::get_or_init`, so two threads wanting
-    /// the SAME texture dedupe (one loads, the other waits) while different
-    /// textures load fully concurrently.
-    cache: std::sync::Mutex<
-        HashMap<String, std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<GpuTexture>>>>>,
-    >,
+    /// Name → per-entry once-cell. Shared-`&self` so the object-build loop
+    /// can run in parallel: the brief map lock only hands out the cell; the
+    /// decode + upload happen inside `OnceLock::get_or_init`, so two threads
+    /// wanting the SAME texture dedupe (one loads, the other waits) while
+    /// different textures load fully concurrently.
+    cache: std::sync::Mutex<HashMap<String, TextureCell>>,
     white: std::sync::Arc<GpuTexture>,
     /// Video-backed textures kept playing; the renderer takes these after build
     /// ([`Self::take_videos`]) and streams frames per render tick.
@@ -311,16 +312,19 @@ impl TextureRegistry {
             return;
         };
         let schedule = content.schedule();
-        self.atlases.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
-            name.to_string(),
-            std::sync::Arc::new(AtlasTexture {
-                frames: content.frames,
-                schedule,
-                // Single-page spritesheets never re-upload; drop their pixels.
-                pages: if multi_page { content.pages } else { Vec::new() },
-                gpu: gpu.clone(),
-            }),
-        );
+        self.atlases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                name.to_string(),
+                std::sync::Arc::new(AtlasTexture {
+                    frames: content.frames,
+                    schedule,
+                    // Single-page spritesheets never re-upload; drop their pixels.
+                    pages: if multi_page { content.pages } else { Vec::new() },
+                    gpu: gpu.clone(),
+                }),
+            );
     }
 
     /// The animated atlas registered for texture `name`, if any. Objects whose
@@ -400,11 +404,14 @@ impl TextureRegistry {
         // Keep the player: the renderer streams later frames into this same
         // texture every tick (the reference PLAYS video .tex, docs §10).
         if let Some(player) = player {
-            self.videos.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(VideoTexture {
-                player,
-                gpu: gpu.clone(),
-                size: (frame.width, frame.height),
-            });
+            self.videos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(VideoTexture {
+                    player,
+                    gpu: gpu.clone(),
+                    size: (frame.width, frame.height),
+                });
         }
         Some(gpu)
     }
@@ -413,7 +420,10 @@ impl TextureRegistry {
     /// the registry is discarded afterwards).
     pub fn take_videos(&mut self) -> Vec<VideoTexture> {
         std::mem::take(
-            &mut *self.videos.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            &mut *self
+                .videos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
 
@@ -422,7 +432,10 @@ impl TextureRegistry {
     /// render tick and streams multi-page frames into the bound texture.
     pub fn take_atlases(&mut self) -> Vec<std::sync::Arc<AtlasTexture>> {
         std::mem::take(
-            &mut *self.atlases.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            &mut *self
+                .atlases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
         .into_values()
         .collect()

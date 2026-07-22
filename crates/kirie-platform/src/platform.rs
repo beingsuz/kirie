@@ -170,7 +170,10 @@ impl WaylandPlatform {
                 layer: Layer::Background,
                 namespace: options.layer_namespace,
                 screen_roots: options.screen_roots,
-                min_frame: options.fps.filter(|f| *f > 0).map(|f| std::time::Duration::from_secs_f64(1.0 / f64::from(f))),
+                min_frame: options
+                    .fps
+                    .filter(|f| *f > 0)
+                    .map(|f| std::time::Duration::from_secs_f64(1.0 / f64::from(f))),
                 playback_speed: if options.playback_speed > 0.0 {
                     options.playback_speed as f32
                 } else {
@@ -240,7 +243,9 @@ impl PlatformState {
         match cmd {
             RenderCommand::Build { screen, stash, build } => {
                 let Some(gpu) = &self.gpu else { return };
-                let Some(ctx) = self.output_for(&screen) else { return };
+                let Some(ctx) = self.output_for(&screen) else {
+                    return;
+                };
                 let Some(format) = ctx.format else { return }; // no frame drawn yet
                 let name = ctx.name.clone();
                 let size = (ctx.physical_size.width, ctx.physical_size.height);
@@ -251,11 +256,21 @@ impl PlatformState {
                 // rendering. The worker sends the result back as `Install`.
                 std::thread::spawn(move || {
                     let renderer = build(&device, &queue, format, &name, size);
-                    let _ = tx.send(RenderCommand::Install { screen: name, stash, renderer });
+                    let _ = tx.send(RenderCommand::Install {
+                        screen: name,
+                        stash,
+                        renderer,
+                    });
                 });
             }
-            RenderCommand::Install { screen, stash, renderer } => {
-                let Some(idx) = self.output_index(&screen) else { return };
+            RenderCommand::Install {
+                screen,
+                stash,
+                renderer,
+            } => {
+                let Some(idx) = self.output_index(&screen) else {
+                    return;
+                };
                 match stash {
                     Some(key) => {
                         let name = self.outputs[idx].name.clone();
@@ -275,7 +290,9 @@ impl PlatformState {
                 }
             }
             RenderCommand::Swap { screen, key, build } => {
-                let Some(idx) = self.output_index(&screen) else { return };
+                let Some(idx) = self.output_index(&screen) else {
+                    return;
+                };
                 let name = self.outputs[idx].name.clone();
                 let hit = self.preloaded.remove(&(name, key)).and_then(|(format, r)| {
                     // Only a format match is a real hit (surface may have
@@ -299,11 +316,18 @@ impl PlatformState {
                     }
                 }
             }
-            RenderCommand::SetProperty { screen, key, value, structural } => {
+            RenderCommand::SetProperty {
+                screen,
+                key,
+                value,
+                structural,
+            } => {
                 // Live property change: update the output's renderer in place and
                 // repaint so it shows next frame (no reload). No-op if the output
                 // or its renderer isn't up yet.
-                let Some(idx) = self.output_index(&screen) else { return };
+                let Some(idx) = self.output_index(&screen) else {
+                    return;
+                };
                 let ctx = &mut self.outputs[idx];
                 if let Some(renderer) = ctx.renderer.as_mut() {
                     // The flag starts `true` (assume structural) so a debounce
@@ -327,8 +351,12 @@ impl PlatformState {
                 // build's duration — a brief hitch on the current wallpaper — then
                 // installs. Needs the GPU + a drawn output (format known).
                 let Some(gpu) = &self.gpu else { return };
-                let Some(idx) = self.output_index(&screen) else { return };
-                let Some(format) = self.outputs[idx].format else { return };
+                let Some(idx) = self.output_index(&screen) else {
+                    return;
+                };
+                let Some(format) = self.outputs[idx].format else {
+                    return;
+                };
                 let name = self.outputs[idx].name.clone();
                 let size = (
                     self.outputs[idx].physical_size.width,
@@ -355,7 +383,9 @@ impl PlatformState {
                 // renderer; any missing → drop (the daemon then falls back to the
                 // workshop preview, which is why no error is surfaced here).
                 let Some(gpu) = &self.gpu else { return };
-                let Some(idx) = self.output_index(&screen) else { return };
+                let Some(idx) = self.output_index(&screen) else {
+                    return;
+                };
                 let ctx = &mut self.outputs[idx];
                 let Some(format) = ctx.format else { return };
                 let size = ctx.physical_size;

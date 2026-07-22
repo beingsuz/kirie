@@ -824,7 +824,11 @@ mod tests {
         });
         let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes[0].blending, Blending::Normal, "no puppet exception");
-        assert_eq!(plan.passes[1].blending, Blending::Translucent, "relocated to last");
+        assert_eq!(
+            plan.passes[1].blending,
+            Blending::Translucent,
+            "relocated to last"
+        );
     }
 
     #[test]

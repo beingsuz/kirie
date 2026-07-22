@@ -213,9 +213,11 @@ impl WebBackend for CefBackend {
             return Err(WebError::Init("the CEF thread is gone".into()));
         }
 
-        let outcome = reply_rx
-            .recv()
-            .unwrap_or_else(|_| Err(WebError::Init("the CEF thread exited during browser creation".into())));
+        let outcome = reply_rx.recv().unwrap_or_else(|_| {
+            Err(WebError::Init(
+                "the CEF thread exited during browser creation".into(),
+            ))
+        });
 
         match outcome {
             Ok(id) => {
@@ -513,7 +515,9 @@ fn create_browser(req: &CreateRequest) -> Option<Browser> {
     )?;
 
     // Apply the initial mute state.
-    if req.muted && let Some(host) = browser.host() {
+    if req.muted
+        && let Some(host) = browser.host()
+    {
         host.set_audio_muted(1);
     }
     Some(browser)

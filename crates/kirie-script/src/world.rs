@@ -204,12 +204,10 @@ impl World {
                 // layer-backed props; fall back to the cache when the layer
                 // doesn't carry the prop (module keys are "<prop>_<objectId>").
                 let arg = match (*owner, key.rsplit_once('_')) {
-                    (Some(id), Some((prop, _))) => {
-                        match call_ret2(&ctx, "__getLayerProp", (id, prop)) {
-                            Ok(v) if !v.is_undefined() => v,
-                            _ => arg,
-                        }
-                    }
+                    (Some(id), Some((prop, _))) => match call_ret2(&ctx, "__getLayerProp", (id, prop)) {
+                        Ok(v) if !v.is_undefined() => v,
+                        _ => arg,
+                    },
                     _ => arg,
                 };
                 match call_export_ret(&ctx, key, "update", arg) {

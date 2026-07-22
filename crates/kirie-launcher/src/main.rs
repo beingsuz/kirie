@@ -132,7 +132,7 @@ fn prune_old_runtimes(root: &Path, keep: &str) {
             Some((e.path(), m))
         })
         .collect();
-    dirs.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.1)); // newest first
     for (path, _) in dirs.into_iter().skip(1) {
         let _ = fs::remove_dir_all(path);
     }

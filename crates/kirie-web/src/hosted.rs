@@ -21,7 +21,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use crate::backend::{FrameBuffer, PixelFormat, PointerState, WebBackend, WebError, WebFrameRef, WebSize};
@@ -54,7 +54,7 @@ pub struct HostedBackend {
     child: Child,
     stdin: ChildStdin,
     /// Read-only mapping of the child's frame memfd.
-    shm: Box<dyn AsRef<[u8]> + Send + Sync>,
+    shm: FrameShm,
     /// Last consumed seqlock value (even = stable).
     last_seq: u64,
     /// Latest copied-out frame, reused across ticks (no per-frame alloc once
@@ -133,12 +133,16 @@ impl HostedBackend {
     }
 }
 
+/// Read-only mapping of the child's frame memfd (opaque owned bytes).
+type FrameShm = Box<dyn AsRef<[u8]> + Send + Sync>;
+
+/// The pieces a live webhost hands back: process, command pipe, frame
+/// mapping, status stream.
+type SpawnedHost = (Child, ChildStdin, FrameShm, Receiver<String>);
+
 /// Spawn the webhost child + status reader, returning the pieces the backend
 /// needs. Shared by the constructor and crash auto-restart.
-fn spawn_host(
-    url: &str,
-    size: WebSize,
-) -> Result<(Child, ChildStdin, Box<dyn AsRef<[u8]> + Send + Sync>, Receiver<String>), WebError> {
+fn spawn_host(url: &str, size: WebSize) -> Result<SpawnedHost, WebError> {
     {
         let host = webhost_path()?;
         let mut child = Command::new(&host)
@@ -153,8 +157,14 @@ fn spawn_host(
             // stderr inherits → the child's tracing lands in the engine log.
             .spawn()
             .map_err(|_| WebError::Init("webhost spawn".into()))?;
-        let stdin = child.stdin.take().ok_or_else(|| WebError::Init("webhost pipes".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| WebError::Init("webhost pipes".into()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| WebError::Init("webhost pipes".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| WebError::Init("webhost pipes".into()))?;
 
         // Status reader thread: forwards stdout lines over a channel so `new`
         // can wait for the shm announcement and `tick` can drain the rest
@@ -220,18 +230,16 @@ impl WebBackend for HostedBackend {
     fn tick(&mut self, _dt: f32) {
         // Drain child status lines (ignored today; keeps the pipe from
         // filling) and pick up the newest stable frame.
-        loop {
-            match self.status_rx.try_recv() {
-                Ok(_) => {}
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
-        }
+        while self.status_rx.try_recv().is_ok() {}
         // Crash auto-restart: a died child (page/GPU crash) respawns with a
         // small budget + backoff; past the budget the last frame stays up
         // (still strictly better than the in-process design, where a browser
         // crash took the whole engine down).
-        if let Ok(Some(status)) = self.child.try_wait() {
-            if self.restarts_left > 0 && Instant::now() >= self.restart_after {
+        if let Ok(Some(status)) = self.child.try_wait()
+            && self.restarts_left > 0
+            && Instant::now() >= self.restart_after
+        {
+            {
                 self.restarts_left -= 1;
                 self.restart_after = Instant::now() + Duration::from_secs(5);
                 tracing::warn!(%status, left = self.restarts_left, "web host died; restarting");
@@ -291,9 +299,7 @@ impl WebBackend for HostedBackend {
         loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
                 _ => {
                     let _ = self.child.kill();
                     let _ = self.child.wait();

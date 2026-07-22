@@ -102,13 +102,7 @@ pub type RendererFactory = Box<dyn FnMut(&RenderTarget<'_>) -> Box<dyn Renderer>
 /// back to the render thread. The app supplies this (it owns the build logic);
 /// the platform just runs it on a worker and swaps the result in.
 pub type BuildFn = Box<
-    dyn FnOnce(
-            &wgpu::Device,
-            &wgpu::Queue,
-            wgpu::TextureFormat,
-            &str,
-            (u32, u32),
-        ) -> Box<dyn Renderer + Send>
+    dyn FnOnce(&wgpu::Device, &wgpu::Queue, wgpu::TextureFormat, &str, (u32, u32)) -> Box<dyn Renderer + Send>
         + Send,
 >;
 
@@ -131,14 +125,11 @@ pub type BuildLocalFn = Box<
 /// surface), reads it back and writes the image. `Send` so it can ride the
 /// command channel from the IPC applier; the app supplies it (it owns the
 /// readback/encode logic and the `image` dependency).
-pub type CaptureFn = Box<
-    dyn FnOnce(&wgpu::Device, &wgpu::Queue, &mut dyn Renderer, SurfaceSize, wgpu::TextureFormat)
-        + Send,
->;
+pub type CaptureFn =
+    Box<dyn FnOnce(&wgpu::Device, &wgpu::Queue, &mut dyn Renderer, SurfaceSize, wgpu::TextureFormat) + Send>;
 
 /// Clone-able sender for [`RenderCommand`]s into the render thread's channel.
-pub type CommandSender =
-    smithay_client_toolkit::reexports::calloop::channel::Sender<RenderCommand>;
+pub type CommandSender = smithay_client_toolkit::reexports::calloop::channel::Sender<RenderCommand>;
 
 /// A command delivered to the render thread over the platform's command channel
 /// (sent by another thread, e.g. the IPC applier). Applied between frames on the

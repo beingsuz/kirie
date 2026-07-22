@@ -8,11 +8,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Full build + test safety check on the DEFAULT (no-web) variant — the build
-  # that must stay green on a machine without libcef/webkit2gtk. fmt + clippy,
-  # then an actual `cargo build` of the whole workspace (links every binary, so
-  # link errors like a missing -lxcb are caught here, not just at release), then
-  # the full test suite.
+  # Lint + test on the DEFAULT (no-web) variant — the build that must stay
+  # green on a machine without libcef/webkit2gtk. clippy --all-targets
+  # type-checks every bin/test/example, and `cargo test` builds + links the
+  # test binaries, so a broken build cannot pass; no separate full `cargo
+  # build` needed.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -39,9 +39,6 @@ jobs:
 
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Full build safe check: compile + link every crate and target (bins, tests,
-      # benches, examples). Debug, not release — this verifies it builds, fast.
-      - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
   # Full build safe check of the two web backends, so neither rots between

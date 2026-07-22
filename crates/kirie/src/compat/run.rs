@@ -57,11 +57,14 @@ use kirie_web::{WebBackend, WebRenderer, WebSize, hosted::HostedBackend};
 /// live swaps/preloads, which share the same engine invocation). f32 bits in an
 /// atomic; 1.0 when unset. The reference treats render scale as engine-global
 /// too (FBOProvider root scale).
-static RENDER_SCALE_BITS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0x3f80_0000); // 1.0f32
+static RENDER_SCALE_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000); // 1.0f32
 
 pub(crate) fn set_render_scale(scale: f32) {
-    let s = if scale.is_finite() { scale.clamp(0.25, 4.0) } else { 1.0 };
+    let s = if scale.is_finite() {
+        scale.clamp(0.25, 4.0)
+    } else {
+        1.0
+    };
     RENDER_SCALE_BITS.store(s.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -454,13 +457,13 @@ fn run_wallpapers(args: CompatArgs) -> ExitCode {
             // Enable live `bg`/`preload` swaps: hand the applier the render
             // thread's command channel + the build params (Wayland only; X11
             // has no channel yet and falls back to relaunch).
-            if let (Some(app), Some(cmd_tx)) = (ipc_app.as_ref(), platform.command_sender()) {
-                if let Ok(mut slot) = app.swap_slot().lock() {
-                    *slot = Some(SwapCtx {
-                        cmd_tx,
-                        build: build_ctx.clone(),
-                    });
-                }
+            if let (Some(app), Some(cmd_tx)) = (ipc_app.as_ref(), platform.command_sender())
+                && let Ok(mut slot) = app.swap_slot().lock()
+            {
+                *slot = Some(SwapCtx {
+                    cmd_tx,
+                    build: build_ctx.clone(),
+                });
             }
             // Playlist rotation rides the same live-swap channel as the socket
             // `bg` command (the reference drives it from the render loop via
@@ -548,8 +551,7 @@ fn spawn_playlist_rotator(
     let mut active: Vec<(String, ActivePlaylist)> = playlists
         .into_iter()
         .filter_map(|(screen, def, current)| {
-            ActivePlaylist::start(def, current.as_deref(), now, &mut rng)
-                .map(|state| (screen, state))
+            ActivePlaylist::start(def, current.as_deref(), now, &mut rng).map(|state| (screen, state))
         })
         .collect();
     if active.is_empty() {
@@ -582,9 +584,7 @@ fn spawn_playlist_rotator(
                         now,
                         &mut rng,
                         |path| playlist_preflight(&build, &screen_key, path, &properties),
-                        |path| {
-                            playlist_show(&cmd_tx, &build, &screen_key, swap_screen, path, &properties)
-                        },
+                        |path| playlist_show(&cmd_tx, &build, &screen_key, swap_screen, path, &properties),
                     );
                 }
             }
@@ -994,15 +994,15 @@ fn web_props_json(dir: &Path, overrides: &[(String, String)]) -> String {
     let Ok(project) = Project::from_path(dir.join("project.json")) else {
         return "{}".to_owned();
     };
-    let over: std::collections::HashMap<&str, &str> = overrides
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
+    let over: std::collections::HashMap<&str, &str> =
+        overrides.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut out = String::from("{");
     let mut first = true;
     for (name, entry) in &project.general.properties {
-        let PropertyEntry::Property(p) = entry else { continue };
+        let PropertyEntry::Property(p) = entry else {
+            continue;
+        };
         let raw = over.get(name.as_str()).copied();
         let value = match &p.kind {
             PropertyKind::Bool { value } => {
@@ -1010,7 +1010,9 @@ fn web_props_json(dir: &Path, overrides: &[(String, String)]) -> String {
                 if v { "true".to_owned() } else { "false".to_owned() }
             }
             PropertyKind::Slider { value, .. } => {
-                let v = raw.and_then(|r| r.trim().parse::<f64>().ok()).unwrap_or(f64::from(*value));
+                let v = raw
+                    .and_then(|r| r.trim().parse::<f64>().ok())
+                    .unwrap_or(f64::from(*value));
                 format!("{v}")
             }
             PropertyKind::Color { value: [r, g, b] } => {
@@ -1296,17 +1298,16 @@ impl BuildContext {
             return None;
         };
         let silent = self.silent;
-        let build: kirie_platform::BuildLocalFn =
-            Box::new(move |device, queue, format, name, size| {
-                let rt = RenderTarget {
-                    device,
-                    queue,
-                    format,
-                    output_name: name,
-                    size,
-                };
-                build_web(&rt, &url, &dir, silent, &properties)
-            });
+        let build: kirie_platform::BuildLocalFn = Box::new(move |device, queue, format, name, size| {
+            let rt = RenderTarget {
+                device,
+                queue,
+                format,
+                output_name: name,
+                size,
+            };
+            build_web(&rt, &url, &dir, silent, &properties)
+        });
         Some(build)
     }
 }

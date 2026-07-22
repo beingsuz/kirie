@@ -149,10 +149,7 @@ impl<B> BrowserRegistry<B> {
 
     /// The entry for `id`, if still live.
     pub fn get_mut(&mut self, id: BrowserId) -> Option<&mut BrowserEntry<B>> {
-        self.entries
-            .iter_mut()
-            .find(|(i, _)| *i == id)
-            .map(|(_, e)| e)
+        self.entries.iter_mut().find(|(i, _)| *i == id).map(|(_, e)| e)
     }
 
     /// `true` when no browser is live.
@@ -307,7 +304,10 @@ mod tests {
         assert!(entry.drain_props_if_painted().is_empty());
 
         paint(&s);
-        assert_eq!(entry.drain_props_if_painted(), vec!["{\"a\":{\"value\":1}}".to_owned()]);
+        assert_eq!(
+            entry.drain_props_if_painted(),
+            vec!["{\"a\":{\"value\":1}}".to_owned()]
+        );
         // Delivered once: the queue is empty afterwards.
         assert!(entry.drain_props_if_painted().is_empty());
     }
@@ -345,7 +345,10 @@ mod tests {
 
         // Only browser A has painted: A's batch is released, B's stays queued.
         paint(&slot_a);
-        assert_eq!(reg.get_mut(a).unwrap().drain_props_if_painted(), vec!["for-a".to_owned()]);
+        assert_eq!(
+            reg.get_mut(a).unwrap().drain_props_if_painted(),
+            vec!["for-a".to_owned()]
+        );
         assert!(reg.get_mut(b).unwrap().drain_props_if_painted().is_empty());
     }
 

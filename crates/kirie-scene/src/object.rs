@@ -114,9 +114,7 @@ impl AnimationTrack {
     /// [`AnimationTrack::relative`]. Applied by C++ to MODEL objects only.
     #[must_use]
     pub fn sample(&self, time_secs: f32) -> Option<[f32; 3]> {
-        if self.length <= 0.0
-            || (self.c0.is_empty() && self.c1.is_empty() && self.c2.is_empty())
-        {
+        if self.length <= 0.0 || (self.c0.is_empty() && self.c1.is_empty() && self.c2.is_empty()) {
             return None;
         }
         let mut frame = time_secs * self.fps;
@@ -638,7 +636,15 @@ mod anim_tests {
     use super::{AnimMode, AnimationTrack, Keyframe};
 
     fn track(c0: Vec<Keyframe>, length: f32, mode: AnimMode) -> AnimationTrack {
-        AnimationTrack { c0, c1: vec![], c2: vec![], fps: 30.0, length, mode, relative: true }
+        AnimationTrack {
+            c0,
+            c1: vec![],
+            c2: vec![],
+            fps: 30.0,
+            length,
+            mode,
+            relative: true,
+        }
     }
     fn kf(frame: f32, value: f32) -> Keyframe {
         Keyframe { frame, value }

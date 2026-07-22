@@ -55,9 +55,7 @@ pub(crate) enum HwAttachError {
 ///
 /// On any `Err` the context is left untouched and fully usable for the
 /// plain CPU open.
-pub(crate) fn attach_vaapi(
-    ctx: &mut ffmpeg::codec::context::Context,
-) -> Result<(), HwAttachError> {
+pub(crate) fn attach_vaapi(ctx: &mut ffmpeg::codec::context::Context) -> Result<(), HwAttachError> {
     let id = ctx.id();
     // Same lookup `Context::decoder().video()` performs, so the hw-config
     // check below inspects the codec that will actually be opened.
@@ -168,8 +166,7 @@ impl HwDownload {
         // previous call with identical geometry/format (direct-copy path);
         // src is a valid decoded VAAPI frame that stays alive across the
         // call. Both pointers come from ffmpeg-next-owned frames.
-        let mut ret =
-            unsafe { ffi::av_hwframe_transfer_data(self.frame.as_mut_ptr(), src.as_ptr(), 0) };
+        let mut ret = unsafe { ffi::av_hwframe_transfer_data(self.frame.as_mut_ptr(), src.as_ptr(), 0) };
         if ret < 0 {
             // A reused destination can go stale (e.g. the driver switched
             // transfer formats); retry once from a clean frame before
@@ -177,8 +174,7 @@ impl HwDownload {
             // SAFETY: same as the av_frame_unref above.
             unsafe { ffi::av_frame_unref(self.frame.as_mut_ptr()) };
             // SAFETY: same as the transfer above, with dst now clean.
-            ret =
-                unsafe { ffi::av_hwframe_transfer_data(self.frame.as_mut_ptr(), src.as_ptr(), 0) };
+            ret = unsafe { ffi::av_hwframe_transfer_data(self.frame.as_mut_ptr(), src.as_ptr(), 0) };
         }
         if ret < 0 {
             return Err(ffmpeg::Error::from(ret));

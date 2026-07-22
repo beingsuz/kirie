@@ -126,7 +126,10 @@ fn osr_two_browsers_share_one_context() {
         }
         std::thread::sleep(Duration::from_millis(16));
     }
-    assert!(b_after, "second browser stopped painting after the first shut down");
+    assert!(
+        b_after,
+        "second browser stopped painting after the first shut down"
+    );
     b.shutdown();
 }
 

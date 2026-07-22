@@ -59,7 +59,10 @@ impl PointerPoll {
 fn hypr_socket_path() -> Option<std::path::PathBuf> {
     let run = std::env::var_os("XDG_RUNTIME_DIR")?;
     let his = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
-    let p = std::path::PathBuf::from(run).join("hypr").join(his).join(".socket.sock");
+    let p = std::path::PathBuf::from(run)
+        .join("hypr")
+        .join(his)
+        .join(".socket.sock");
     p.exists().then_some(p)
 }
 

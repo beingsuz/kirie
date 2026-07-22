@@ -261,9 +261,10 @@ impl ScriptHost {
         // Text-layer scripts (WE clock/date drivers on a text object's `text`
         // setting, docs §7.2) also need the engine — a scene with only those
         // and no property scripts must still spawn it.
-        let has_text_scripts = model.scene.objects.iter().any(|o| {
-            matches!(&o.kind, kirie_scene::object::ObjectKind::Text(t) if t.text.script.is_some())
-        });
+        let has_text_scripts =
+            model.scene.objects.iter().any(
+                |o| matches!(&o.kind, kirie_scene::object::ObjectKind::Text(t) if t.text.script.is_some()),
+            );
         if pending.is_empty() && !has_text_scripts {
             return None;
         }
@@ -384,11 +385,7 @@ impl ScriptHost {
         let now = std::time::Instant::now();
         let wall = now.duration_since(self.last_tick).as_secs_f64();
         self.last_tick = now;
-        frame.frametime = if dt > 0.0 {
-            f64::from(dt)
-        } else {
-            wall.max(1e-4)
-        };
+        frame.frametime = if dt > 0.0 { f64::from(dt) } else { wall.max(1e-4) };
         frame.now = self.elapsed * 1000.0;
         frame.res_x = f64::from(self.res[0]);
         frame.res_y = f64::from(self.res[1]);
@@ -448,11 +445,7 @@ impl ScriptHost {
     /// the new value. This is what makes a **script-driven** property (e.g. a
     /// `coloring` combo that recolors the scene) update live, not just direct
     /// material/camera/general bindings.
-    pub fn apply_user_property(
-        &mut self,
-        key: &str,
-        value: &kirie_scene::PropertyValue,
-    ) -> Vec<PropUpdate> {
+    pub fn apply_user_property(&mut self, key: &str, value: &kirie_scene::PropertyValue) -> Vec<PropUpdate> {
         let sv = prop_to_script(value);
         self.user_props.insert(key.to_owned(), sv.clone());
         // The retained frame's copy of `engine.userProperties` is now stale;
@@ -541,12 +534,7 @@ impl ScriptHost {
                     });
                     self.created.push((layer_id, path));
                 }
-                SceneOp::SetCameraTransforms {
-                    eye,
-                    center,
-                    up,
-                    fov,
-                } => {
+                SceneOp::SetCameraTransforms { eye, center, up, fov } => {
                     merge_camera(&mut self.camera_op, eye, center, up, fov);
                     // `getCameraTransforms` reports the BASE eye/center/up but
                     // the *overridden* fov (`getBaseEye`/`getFov`,

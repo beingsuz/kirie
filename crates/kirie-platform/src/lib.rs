@@ -48,10 +48,10 @@ mod x11;
 
 pub use backend::{Backend, Platform, PresentOptions};
 pub use error::PlatformError;
-pub use renderer::{
-    BuildFn, BuildLocalFn, CaptureFn, CommandSender, PropertyImpact, RenderCommand, RenderTarget,
-    Renderer, RendererFactory, SurfaceSize,
-};
 pub use gpu::{attach_pipeline_cache, persist_pipeline_cache, pipeline_cache};
+pub use renderer::{
+    BuildFn, BuildLocalFn, CaptureFn, CommandSender, PropertyImpact, RenderCommand, RenderTarget, Renderer,
+    RendererFactory, SurfaceSize,
+};
 pub use test_pattern::TestPattern;
 pub use x11::X11Mode;

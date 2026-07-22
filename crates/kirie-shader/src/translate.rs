@@ -230,11 +230,7 @@ pub(crate) fn unit_cache_load(
 }
 
 /// Store a translated unit for `key` (best-effort, atomic).
-pub(crate) fn unit_cache_store(
-    key: &str,
-    includes: Vec<(String, [u8; 32])>,
-    ts: &crate::TranslatedShader,
-) {
+pub(crate) fn unit_cache_store(key: &str, includes: Vec<(String, [u8; 32])>, ts: &crate::TranslatedShader) {
     let entry = UnitEntry {
         includes,
         glsl: ts.glsl.clone(),
@@ -312,7 +308,7 @@ fn maybe_prune_cache(dir: &std::path::Path) {
     if remaining <= SHADER_CACHE_CAP_BYTES {
         return;
     }
-    files.sort_by(|a, b| a.2.cmp(&b.2)); // oldest first
+    files.sort_by_key(|f| f.2); // oldest first
     for (path, len, _) in files {
         if remaining <= SHADER_CACHE_CAP_BYTES {
             break;

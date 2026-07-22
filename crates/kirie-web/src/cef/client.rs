@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use cef::{
-    Browser, Client, ImplClient, ImplLifeSpanHandler, ImplRenderHandler, LifeSpanHandler,
-    PaintElementType, Rect, RenderHandler, WrapClient, WrapLifeSpanHandler, WrapRenderHandler,
-    rc::Rc, wrap_client, wrap_life_span_handler, wrap_render_handler,
+    Browser, Client, ImplClient, ImplLifeSpanHandler, ImplRenderHandler, LifeSpanHandler, PaintElementType,
+    Rect, RenderHandler, WrapClient, WrapLifeSpanHandler, WrapRenderHandler, rc::Rc, wrap_client,
+    wrap_life_span_handler, wrap_render_handler,
 };
 
 use crate::backend::{FrameBuffer, FrameSlot, PixelFormat};

@@ -300,7 +300,7 @@ fn scene_corpus_renders_simplest_scenes_non_black() {
             queue: &queue,
             format: FORMAT,
             output_name: "corpus",
-        size: (1920, 1080),
+            size: (1920, 1080),
         };
         let mut renderer = match SceneRenderer::new(
             &target,

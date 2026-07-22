@@ -224,7 +224,11 @@ fn build_definition(json: &Value, fallback: &str) -> Option<PlaylistDefinition> 
         }
         name = fallback.to_owned();
     }
-    Some(PlaylistDefinition { name, items, settings })
+    Some(PlaylistDefinition {
+        name,
+        items,
+        settings,
+    })
 }
 
 /// `ApplicationContext::parsePlaylistSettings` (ApplicationContext.cpp:110-119),
@@ -499,9 +503,7 @@ impl ActivePlaylist {
     /// WallpaperApplication.cpp:451-475): timer mode only, more than one item,
     /// interval elapsed.
     pub(crate) fn due(&self, now: Instant) -> bool {
-        self.definition.settings.mode == "timer"
-            && self.definition.items.len() > 1
-            && now >= self.next_switch
+        self.definition.settings.mode == "timer" && self.definition.items.len() > 1 && now >= self.next_switch
     }
 
     /// `WallpaperApplication::selectNextCandidate`
@@ -581,10 +583,7 @@ mod tests {
 
     /// A unique temp dir for one test (created; caller removes).
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kirie-playlist-test-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("kirie-playlist-test-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -715,11 +714,7 @@ mod tests {
     fn test_definition(order: &str, delay: u32) -> PlaylistDefinition {
         PlaylistDefinition {
             name: "t".to_owned(),
-            items: vec![
-                PathBuf::from("/a"),
-                PathBuf::from("/b"),
-                PathBuf::from("/c"),
-            ],
+            items: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")],
             settings: PlaylistSettings {
                 delay_minutes: delay,
                 order: order.to_owned(),
@@ -800,11 +795,7 @@ mod tests {
         }
         assert_eq!(
             shown,
-            vec![
-                PathBuf::from("/c"),
-                PathBuf::from("/a"),
-                PathBuf::from("/c"),
-            ]
+            vec![PathBuf::from("/c"), PathBuf::from("/a"), PathBuf::from("/c"),]
         );
     }
 
@@ -824,10 +815,16 @@ mod tests {
         // show is never called again; the timer still reschedules.
         let mut calls = 0;
         for _ in 0..6 {
-            pl.advance("s", now, &mut rng, |_| true, |_| {
-                calls += 1;
-                false
-            });
+            pl.advance(
+                "s",
+                now,
+                &mut rng,
+                |_| true,
+                |_| {
+                    calls += 1;
+                    false
+                },
+            );
         }
         assert_eq!(calls, 3, "each item fails exactly once, then all are skipped");
         assert!(!pl.due(now), "next switch must be rescheduled");

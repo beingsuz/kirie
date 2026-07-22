@@ -648,10 +648,7 @@ fn parse_with(
                 // item backfills an unset default background.
                 let name = value()?;
                 let def = load_playlist(&name)?;
-                let first = def
-                    .items
-                    .first()
-                    .map(|p| p.to_string_lossy().into_owned());
+                let first = def.items.first().map(|p| p.to_string_lossy().into_owned());
                 match cursor {
                     Cursor::Screen(idx) => {
                         if let Some(first) = &first {
@@ -1176,7 +1173,10 @@ mod tests {
         assert_eq!(pl.name, "day");
         assert_eq!(args.default_background.as_deref(), Some("/wp/one"));
         assert!(args.screens.is_empty());
-        assert!(validate(args).is_ok(), "a playlist satisfies the background check");
+        assert!(
+            validate(args).is_ok(),
+            "a playlist satisfies the background check"
+        );
     }
 
     #[test]

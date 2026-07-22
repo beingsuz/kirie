@@ -42,5 +42,7 @@ pub use media::{
 };
 pub use renderer::{ImageOptions, ImageRenderer};
 pub use scaling::{ClampMode, ScalingMode, UvWindow};
-pub use scene::{SceneError, SceneLoadError, SceneOptions, SceneRenderer, load_workshop_scene, start_background_prebake};
+pub use scene::{
+    SceneError, SceneLoadError, SceneOptions, SceneRenderer, load_workshop_scene, start_background_prebake,
+};
 pub use schedule::FrameSchedule;

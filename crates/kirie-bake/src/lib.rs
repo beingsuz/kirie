@@ -104,8 +104,7 @@ pub fn pageout_cold_libs() {
         let Some((a, b)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(start), Ok(end)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16))
-        else {
+        let (Ok(start), Ok(end)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else {
             continue;
         };
         if end <= start {
@@ -131,9 +130,7 @@ pub fn pageout_cold_libs() {
 /// private; kirie treats workshop content as immutable while an engine runs —
 /// the same assumption the bundle/shader caches already make. An external
 /// truncation during use would fault, exactly like the cache mmaps above.
-pub fn map_readonly(
-    path: &std::path::Path,
-) -> std::io::Result<Box<dyn AsRef<[u8]> + Send + Sync>> {
+pub fn map_readonly(path: &std::path::Path) -> std::io::Result<Box<dyn AsRef<[u8]> + Send + Sync>> {
     let f = std::fs::File::open(path)?;
     // SAFETY: read-only mapping of a file kirie never writes while mapped
     // (workshop content is immutable per the crate contract above).

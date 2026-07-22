@@ -329,7 +329,9 @@ impl Builtins {
             "g_ModelMatrix" | "g_EffectModelMatrix" => set(buf, &self.model),
             "g_ModelMatrixInverse" => set(buf, &super::matrix::inverse(&self.model)),
             "g_ViewProjectionMatrix" => set(buf, &self.view_projection),
-            "g_EffectTextureProjectionMatrix" | "g_EffectTextureProjectionMatrixInverse" => set(buf, &IDENTITY),
+            "g_EffectTextureProjectionMatrix" | "g_EffectTextureProjectionMatrixInverse" => {
+                set(buf, &IDENTITY)
+            }
             "g_NormalModelMatrix" => set(buf, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
             // Particle/model additions (docs §8.3). The 2D image path does not
             // drive these; supply non-degenerate defaults (unit axes, an eye on

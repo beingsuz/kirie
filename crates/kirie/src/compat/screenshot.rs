@@ -264,15 +264,18 @@ impl Headless {
                     let (device, queue) =
                         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                             label: Some("kirie-screenshot"),
-                            required_features: adapter.features()
-                                & wgpu::Features::PIPELINE_CACHE,
+                            required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
                             ..wgpu::DeviceDescriptor::default()
                         }))
                         .context("request headless wgpu device")?;
                     // Warm/persist the driver pipeline cache here too, so
                     // `--screenshot` runs share the engine's compiled binaries.
                     kirie_platform::attach_pipeline_cache(&device, &adapter);
-                    return Ok(Self { device, queue, adapter });
+                    return Ok(Self {
+                        device,
+                        queue,
+                        adapter,
+                    });
                 }
                 Err(err) => last = Some(anyhow!("no adapter on {backends:?}: {err}")),
             }
@@ -526,7 +529,7 @@ pub fn capture_live(
         format,
         wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
     ) {
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
     }

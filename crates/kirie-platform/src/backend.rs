@@ -95,6 +95,8 @@ impl Backend {
 /// The presentation layer: owns whichever backend was selected. All variants
 /// drive the same [`crate::Renderer`] contract (SPEC V1: state owned here,
 /// nothing global).
+// One long-lived instance per process; the variant size skew is irrelevant.
+#[allow(clippy::large_enum_variant)]
 pub enum Platform {
     /// Wayland layer-shell backend.
     Wayland(WaylandPlatform),

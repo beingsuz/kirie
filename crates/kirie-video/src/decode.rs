@@ -320,9 +320,7 @@ impl Decoder {
         let needs_scaler = match &converter.scaler {
             None => true,
             Some(s) => {
-                s.input().format != decoded.format()
-                    || s.input().width != width
-                    || s.input().height != height
+                s.input().format != decoded.format() || s.input().width != width || s.input().height != height
             }
         };
         if needs_scaler {
@@ -400,9 +398,7 @@ fn open_video_decoder(
         match crate::hw::attach_vaapi(&mut context) {
             Ok(()) => match context.decoder().video() {
                 Ok(decoder) => {
-                    tracing::info!(
-                        "VAAPI device attached; hardware decode enabled for supported profiles"
-                    );
+                    tracing::info!("VAAPI device attached; hardware decode enabled for supported profiles");
                     return Ok(decoder);
                 }
                 Err(err) => {
@@ -412,9 +408,11 @@ fn open_video_decoder(
             Err(err) => tracing::info!(%err, "VAAPI unavailable; using CPU decode"),
         }
     }
-    Ok(ffmpeg::codec::context::Context::from_parameters(stream.parameters())?
-        .decoder()
-        .video()?)
+    Ok(
+        ffmpeg::codec::context::Context::from_parameters(stream.parameters())?
+            .decoder()
+            .video()?,
+    )
 }
 
 /// Copy the RGBA plane into `buf`, dropping any stride padding so the

@@ -546,8 +546,7 @@ impl SceneRenderer {
                     .any(|o| o.base.id == *id && matches!(o.kind, ObjectKind::Image(_)))
             })
             .collect();
-        let mut donor_built: std::collections::HashMap<usize, ObjectGpu> =
-            std::collections::HashMap::new();
+        let mut donor_built: std::collections::HashMap<usize, ObjectGpu> = std::collections::HashMap::new();
         let mut cross: std::collections::HashMap<String, wgpu::TextureView> =
             std::collections::HashMap::new();
         // Build-scoped reflection interning (dropped with `new`; the shared
@@ -603,8 +602,7 @@ impl SceneRenderer {
                 .iter()
                 .copied()
                 .filter(|oi| {
-                    !donor_built.contains_key(oi)
-                        && matches!(&scene.objects[*oi].kind, ObjectKind::Image(_))
+                    !donor_built.contains_key(oi) && matches!(&scene.objects[*oi].kind, ObjectKind::Image(_))
                 })
                 .collect();
             image_indices
@@ -739,8 +737,7 @@ impl SceneRenderer {
                 if let SceneItem::Text(tg) = item {
                     let initial = tg.current_text().to_owned();
                     if let Some(ts) = tg.script.as_mut() {
-                        ts.handle =
-                            host.create_text_layer(&ts.source, ts.properties.clone(), &initial);
+                        ts.handle = host.create_text_layer(&ts.source, ts.properties.clone(), &initial);
                     }
                 }
             }
@@ -941,8 +938,7 @@ impl SceneRenderer {
             // themselves. Runtime layers always composite *above* the scene
             // items regardless (their stage draws after 1b — a tracked
             // difference from the reference's fully interleaved list).
-            let pos: HashMap<i64, usize> =
-                order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            let pos: HashMap<i64, usize> = order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
             for (id, layer) in &mut self.runtime_layers {
                 if let Some(&p) = pos.get(id) {
                     layer.order = p as i64;
@@ -1183,7 +1179,9 @@ fn build_object(
         ) {
             Ok(mut b) => {
                 let (params_vs, params_fs) = intern_params(
-                    &mut param_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                    &mut param_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
                     &plan_pass.shader,
                     std::mem::take(&mut b.vs_params),
                     std::mem::take(&mut b.fs_params),
@@ -1243,7 +1241,10 @@ fn build_object(
         let s = if decl.scale > 0.0 { decl.scale } else { 1.0 };
         let w = ((iw as f32 / s).round() as u32).max(1);
         let h = ((ih as f32 / s).round() as u32).max(1);
-        named_fbos.insert(decl.name.clone(), Fbo::new(device, "kirie-effect-fbo", sdim(w), sdim(h)));
+        named_fbos.insert(
+            decl.name.clone(),
+            Fbo::new(device, "kirie-effect-fbo", sdim(w), sdim(h)),
+        );
     }
     // The two composite reference names for this object's id (both resolve to the
     // current composite front — the reference's `_a`/`_b` ping-pong pair).
@@ -1559,8 +1560,7 @@ fn collect_visibility_bindings(scene: &kirie_scene::Scene) -> Vec<VisBinding> {
                 ObjectKind::Image(img) => Some(img.visible.clone()),
                 _ => None,
             };
-            let bound = o.base.visible.user.is_some()
-                || image.as_ref().is_some_and(|us| us.user.is_some());
+            let bound = o.base.visible.user.is_some() || image.as_ref().is_some_and(|us| us.user.is_some());
             bound.then(|| VisBinding {
                 id: o.base.id,
                 base: o.base.visible.clone(),
@@ -1947,7 +1947,9 @@ impl Renderer for SceneRenderer {
                     // the composite-so-far so the read never aliases the write
                     // (docs §11 shadow-copy; the copy sees every earlier object
                     // because encoder passes run in order).
-                    if object.reads_scene && let Some(snap_tex) = snap_tex {
+                    if object.reads_scene
+                        && let Some(snap_tex) = snap_tex
+                    {
                         encoder.copy_texture_to_texture(
                             scene_tex.as_image_copy(),
                             snap_tex.as_image_copy(),
@@ -1993,7 +1995,9 @@ impl Renderer for SceneRenderer {
                     // REFLECTION meshes sample `_rt_FullFrameBuffer`: snapshot the
                     // composite-so-far first so the read never aliases the write
                     // (docs §6/§11 shadow-copy; `CModel::render` blits the scene).
-                    if mg.reads_scene && let Some(snap_tex) = snap_tex {
+                    if mg.reads_scene
+                        && let Some(snap_tex) = snap_tex
+                    {
                         encoder.copy_texture_to_texture(
                             scene_tex.as_image_copy(),
                             snap_tex.as_image_copy(),
@@ -2397,13 +2401,12 @@ fn runtime_draw_order(layers: &std::collections::HashMap<i64, RuntimeLayer>) -> 
 /// Apply script updates addressed to runtime layers (synthetic ids from
 /// `createLayer`): transform, color, alpha and visibility all drive the solid
 /// quad drawn for the layer each frame.
-fn apply_runtime_updates(
-    layers: &mut std::collections::HashMap<i64, RuntimeLayer>,
-    updates: &[PropUpdate],
-) {
+fn apply_runtime_updates(layers: &mut std::collections::HashMap<i64, RuntimeLayer>, updates: &[PropUpdate]) {
     use super::scripting::as_vec3;
     for u in updates {
-        let Some(l) = layers.get_mut(&u.object_id) else { continue };
+        let Some(l) = layers.get_mut(&u.object_id) else {
+            continue;
+        };
         match u.target {
             PropTarget::Origin => {
                 if let Some(v) = as_vec3(&u.value) {
@@ -2445,8 +2448,6 @@ fn apply_runtime_updates(
 /// transparent), the final pass composites into `scene_view` (`LoadOp::Load`).
 /// Factored out of [`SceneRenderer::render`] so the item loop can borrow the
 /// object mutably while reading the renderer's other fields.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn draw_image_object(
     encoder: &mut wgpu::CommandEncoder,
@@ -3361,13 +3362,20 @@ mod tests {
     fn reparent_moves_visibility_gating() {
         let mut parent_by_id: HashMap<i64, Option<i64>> =
             [(1, None), (2, None), (3, Some(1))].into_iter().collect();
-        let visible_by_id: HashMap<i64, bool> =
-            [(1, true), (2, false), (3, true)].into_iter().collect();
+        let visible_by_id: HashMap<i64, bool> = [(1, true), (2, false), (3, true)].into_iter().collect();
         let start = |p: &HashMap<i64, Option<i64>>| p.get(&3).copied().flatten();
-        assert!(ancestors_visible(&parent_by_id, &visible_by_id, start(&parent_by_id)));
+        assert!(ancestors_visible(
+            &parent_by_id,
+            &visible_by_id,
+            start(&parent_by_id)
+        ));
         // The script host emits (3, 2); the renderer rewrites the map.
         parent_by_id.insert(3, Some(2));
-        assert!(!ancestors_visible(&parent_by_id, &visible_by_id, start(&parent_by_id)));
+        assert!(!ancestors_visible(
+            &parent_by_id,
+            &visible_by_id,
+            start(&parent_by_id)
+        ));
     }
 
     /// Runtime layers draw in creation order by default: synthetic ids descend

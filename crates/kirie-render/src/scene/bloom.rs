@@ -66,6 +66,7 @@ impl Bloom {
     /// (combine's scene input, so the additive write to the scene FBO doesn't
     /// read-alias itself). `strength`/`threshold` come from `general.bloomstrength`
     /// / `general.bloomthreshold` (resolved), matching WE `CScene.cpp:160`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -81,8 +82,20 @@ impl Bloom {
         // blurs. HDR (16F) targets here let unclamped planet cores spread through
         // the gaussians and roughly double the halo radius vs the reference.
         const BLOOM_RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-        let quarter = Fbo::with_format(device, "kirie-bloom-quarter", proj_w / 4, proj_h / 4, BLOOM_RT_FORMAT);
-        let eighth = Fbo::with_format(device, "kirie-bloom-eighth", proj_w / 8, proj_h / 8, BLOOM_RT_FORMAT);
+        let quarter = Fbo::with_format(
+            device,
+            "kirie-bloom-quarter",
+            proj_w / 4,
+            proj_h / 4,
+            BLOOM_RT_FORMAT,
+        );
+        let eighth = Fbo::with_format(
+            device,
+            "kirie-bloom-eighth",
+            proj_w / 8,
+            proj_h / 8,
+            BLOOM_RT_FORMAT,
+        );
         let bloom = Fbo::with_format(device, "kirie-bloom", proj_w / 8, proj_h / 8, BLOOM_RT_FORMAT);
 
         let texel = [1.0 / proj_w.max(1) as f32, 1.0 / proj_h.max(1) as f32];
@@ -141,11 +154,7 @@ impl Bloom {
         // Layout A: sampler + one texture + a uniform (bright + blur reuse it).
         let tex_ub_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("kirie-bloom-tex-ub-layout"),
-            entries: &[
-                sampler_entry(0),
-                texture_entry(1),
-                uniform_entry(2),
-            ],
+            entries: &[sampler_entry(0), texture_entry(1), uniform_entry(2)],
         });
         // Layout B: sampler + two textures (combine).
         let two_tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -232,18 +241,31 @@ impl Bloom {
     /// Record the four bloom passes into `encoder`. Must run after the scene has
     /// composited into `scene_fbo` and before the blit. `scene_snapshot` is
     /// COPY_DST'd from `scene_fbo` here so combine reads an un-aliased copy.
-    pub(crate) fn run(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        scene_fbo: &Fbo,
-        scene_snapshot: &Fbo,
-    ) {
+    pub(crate) fn run(&self, encoder: &mut wgpu::CommandEncoder, scene_fbo: &Fbo, scene_snapshot: &Fbo) {
         // 1. bright-pass + downsample: scene → quarter.
-        self.pass(encoder, "bright", &self.bright_pipeline, &self.bright_bind, &self.quarter.view);
+        self.pass(
+            encoder,
+            "bright",
+            &self.bright_pipeline,
+            &self.bright_bind,
+            &self.quarter.view,
+        );
         // 2. blur X + downsample: quarter → eighth.
-        self.pass(encoder, "blurx", &self.blur_pipeline, &self.blur_x_bind, &self.eighth.view);
+        self.pass(
+            encoder,
+            "blurx",
+            &self.blur_pipeline,
+            &self.blur_x_bind,
+            &self.eighth.view,
+        );
         // 3. blur Y: eighth → bloom.
-        self.pass(encoder, "blury", &self.blur_pipeline, &self.blur_y_bind, &self.bloom.view);
+        self.pass(
+            encoder,
+            "blury",
+            &self.blur_pipeline,
+            &self.blur_y_bind,
+            &self.bloom.view,
+        );
         // 4. snapshot the pre-bloom scene, then combine scene + bloom → scene FBO.
         encoder.copy_texture_to_texture(
             scene_fbo.texture.as_image_copy(),
@@ -254,7 +276,13 @@ impl Bloom {
                 depth_or_array_layers: 1,
             },
         );
-        self.pass(encoder, "combine", &self.combine_pipeline, &self.combine_bind, &scene_fbo.view);
+        self.pass(
+            encoder,
+            "combine",
+            &self.combine_pipeline,
+            &self.combine_bind,
+            &scene_fbo.view,
+        );
     }
 
     fn pass(

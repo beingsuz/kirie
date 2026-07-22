@@ -57,9 +57,7 @@ fn pipeline_cache_file(adapter: &wgpu::Adapter) -> Option<std::path::PathBuf> {
 /// adapter lacks `PIPELINE_CACHE`.
 #[allow(unsafe_code)]
 pub fn attach_pipeline_cache(device: &wgpu::Device, adapter: &wgpu::Adapter) {
-    if !device.features().contains(wgpu::Features::PIPELINE_CACHE)
-        || SHARED_PIPELINE_CACHE.get().is_some()
-    {
+    if !device.features().contains(wgpu::Features::PIPELINE_CACHE) || SHARED_PIPELINE_CACHE.get().is_some() {
         return;
     }
     let data = pipeline_cache_file(adapter).and_then(|p| std::fs::read(p).ok());
@@ -142,8 +140,7 @@ impl Gpu {
                             label: Some("kirie-platform"),
                             // Driver pipeline cache (Vulkan): reuse compiled
                             // pipeline binaries across launches when supported.
-                            required_features: adapter.features()
-                                & wgpu::Features::PIPELINE_CACHE,
+                            required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
                             ..wgpu::DeviceDescriptor::default()
                         }))?;
                     attach_pipeline_cache(&device, &adapter);

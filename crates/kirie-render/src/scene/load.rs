@@ -214,8 +214,7 @@ pub fn load_workshop_scene(
     // decode still run in SceneRenderer::new either way (kirie-shader's own
     // content-addressed `.kirie-cache` keeps shaders warm).
     let bundle_cache = kirie_bake::Cache::open_default().ok();
-    let bundle_src =
-        super::bundle::bundle_source(pkg.as_bytes(), project_bytes.as_deref(), assets_dir);
+    let bundle_src = super::bundle::bundle_source(pkg.as_bytes(), project_bytes.as_deref(), assets_dir);
     let baked = bundle_cache
         .as_ref()
         .and_then(|cache| super::bundle::try_load_model(cache, &bundle_src));
@@ -291,8 +290,10 @@ pub fn start_background_prebake(
 
     let source_fn: kirie_bake::SourceFn = std::sync::Arc::new(move |item: &Path| {
         let pkg_path = item.join("scene.pkg");
-        let pkg = kirie_bake::map_readonly(&pkg_path)
-            .map_err(|e| kirie_bake::BakeError::Io { path: pkg_path.clone(), source: e })?;
+        let pkg = kirie_bake::map_readonly(&pkg_path).map_err(|e| kirie_bake::BakeError::Io {
+            path: pkg_path.clone(),
+            source: e,
+        })?;
         let project = std::fs::read(item.join("project.json")).ok();
         Ok(super::bundle::bundle_source(
             (*pkg).as_ref(),
@@ -303,10 +304,12 @@ pub fn start_background_prebake(
 
     let content_fn: kirie_bake::ContentFn = std::sync::Arc::new(move |item: &Path, _src: &[u8]| {
         let pkg_path = item.join("scene.pkg");
-        let map = kirie_bake::map_readonly(&pkg_path)
-            .map_err(|e| kirie_bake::BakeError::Io { path: pkg_path.clone(), source: e })?;
-        let pkg = OwnedPkg::from_external(map)
-            .map_err(|e| kirie_bake::BakeError::Serialize(e.to_string()))?;
+        let map = kirie_bake::map_readonly(&pkg_path).map_err(|e| kirie_bake::BakeError::Io {
+            path: pkg_path.clone(),
+            source: e,
+        })?;
+        let pkg =
+            OwnedPkg::from_external(map).map_err(|e| kirie_bake::BakeError::Serialize(e.to_string()))?;
         // Shader translation warms per-wallpaper caches; keep the same
         // per-item cache dir convention as the real load.
         kirie_shader::translate::set_cache_dir(Some(item.join(".kirie-cache")));

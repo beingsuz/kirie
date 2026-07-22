@@ -158,10 +158,8 @@ mod tests {
         fn new(tag: &str) -> Self {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let p = std::env::temp_dir().join(format!(
-                "kirie-render-bundle-{}-{tag}-{n}",
-                std::process::id()
-            ));
+            let p =
+                std::env::temp_dir().join(format!("kirie-render-bundle-{}-{tag}-{n}", std::process::id()));
             std::fs::create_dir_all(&p).unwrap();
             TmpDir(p)
         }
@@ -194,8 +192,7 @@ mod tests {
         match path {
             "models/test.json" => Some(br#"{ "material": "materials/test.json" }"#.to_vec()),
             "materials/test.json" => Some(
-                br#"{ "passes": [ { "shader": "genericimage2", "blending": "translucent" } ] }"#
-                    .to_vec(),
+                br#"{ "passes": [ { "shader": "genericimage2", "blending": "translucent" } ] }"#.to_vec(),
             ),
             _ => None,
         }
@@ -220,7 +217,7 @@ mod tests {
 
         let mut bag = PropertyBag::new();
         bag.insert("show", PropertyValue::Bool(false));
-        let props = vec![("show".to_owned(), PropertyValue::Bool(false))];
+        let _props = [("show".to_owned(), PropertyValue::Bool(false))];
 
         let direct = build_direct(&bag);
         // Sanity: resolution actually collapsed the binding (value true→false)
@@ -273,7 +270,10 @@ mod tests {
 
         let direct = build_direct(&overridden);
         assert_eq!(from_bundle, direct, "defaults-bake + reresolve == direct resolve");
-        assert!(!from_bundle.scene.objects[0].base.visible.value, "override applied");
+        assert!(
+            !from_bundle.scene.objects[0].base.visible.value,
+            "override applied"
+        );
 
         // And back again — bindings survive any number of re-resolutions.
         let mut back = from_bundle;

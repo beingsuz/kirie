@@ -103,7 +103,9 @@ fn pack(build_dir: &Path, output: &Path) -> io::Result<PackInfo> {
 
     // Compress tar(stage) into memory (multi-threaded to keep pack time sane).
     let mut encoder = zstd::Encoder::new(Vec::new(), ZSTD_LEVEL)?;
-    let workers = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
     let _ = encoder.multithread(workers);
     {
         let mut builder = tar::Builder::new(&mut encoder);
@@ -173,7 +175,9 @@ fn strip_stage(stage: &Path) {
     let Ok(entries) = fs::read_dir(stage) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         let is_bin_or_lib =
             name == "kirie" || name == "kirie-cef-helper" || name == "kirie-webhost" || name.contains(".so");
         if !is_bin_or_lib {
