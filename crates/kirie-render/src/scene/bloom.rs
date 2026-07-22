@@ -76,9 +76,14 @@ impl Bloom {
         strength: f32,
         threshold: f32,
     ) -> Self {
-        let quarter = Fbo::new(device, "kirie-bloom-quarter", proj_w / 4, proj_h / 4);
-        let eighth = Fbo::new(device, "kirie-bloom-eighth", proj_w / 8, proj_h / 8);
-        let bloom = Fbo::new(device, "kirie-bloom", proj_w / 8, proj_h / 8);
+        // The reference's bloom chain targets are 8-bit (`TextureFormat_ARGB8888`,
+        // CScene.cpp:118-130) — the bright-pass output clamps at 1.0 before the
+        // blurs. HDR (16F) targets here let unclamped planet cores spread through
+        // the gaussians and roughly double the halo radius vs the reference.
+        const BLOOM_RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+        let quarter = Fbo::with_format(device, "kirie-bloom-quarter", proj_w / 4, proj_h / 4, BLOOM_RT_FORMAT);
+        let eighth = Fbo::with_format(device, "kirie-bloom-eighth", proj_w / 8, proj_h / 8, BLOOM_RT_FORMAT);
+        let bloom = Fbo::with_format(device, "kirie-bloom", proj_w / 8, proj_h / 8, BLOOM_RT_FORMAT);
 
         let texel = [1.0 / proj_w.max(1) as f32, 1.0 / proj_h.max(1) as f32];
         let bright_ub = create_uniform(
@@ -148,9 +153,11 @@ impl Bloom {
             entries: &[sampler_entry(0), texture_entry(1), texture_entry(2)],
         });
 
-        let bright_pipeline = make_pipeline(device, &bright_mod, &tex_ub_layout);
-        let blur_pipeline = make_pipeline(device, &blur_mod, &tex_ub_layout);
-        let combine_pipeline = make_pipeline(device, &combine_mod, &two_tex_layout);
+        // Bright + blurs render into the 8-bit chain; combine writes back into
+        // the HDR scene FBO.
+        let bright_pipeline = make_pipeline(device, &bright_mod, &tex_ub_layout, BLOOM_RT_FORMAT);
+        let blur_pipeline = make_pipeline(device, &blur_mod, &tex_ub_layout, BLOOM_RT_FORMAT);
+        let combine_pipeline = make_pipeline(device, &combine_mod, &two_tex_layout, FBO_FORMAT);
 
         let bright_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("kirie-bloom-bright-bind"),
@@ -295,6 +302,7 @@ fn make_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     bind_layout: &wgpu::BindGroupLayout,
+    target_format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("kirie-bloom-pipeline-layout"),
@@ -315,7 +323,7 @@ fn make_pipeline(
             entry_point: Some("fs"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: FBO_FORMAT,
+                format: target_format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],

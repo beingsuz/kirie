@@ -30,6 +30,21 @@ impl Fbo {
     /// least 1 so a degenerate size never panics, SPEC.md §V9).
     #[must_use]
     pub fn new(device: &wgpu::Device, label: &str, width: u32, height: u32) -> Self {
+        Self::with_format(device, label, width, height, FBO_FORMAT)
+    }
+
+    /// [`Fbo::new`] with an explicit texture format. The bloom chain needs
+    /// 8-bit targets: the reference's `_rt_4FrameBuffer`/`_rt_8FrameBuffer`/
+    /// `_rt_Bloom` are `TextureFormat_ARGB8888` (CScene.cpp:118-130), so the
+    /// bright-pass output clamps at 1.0 before the blurs — HDR targets spread
+    /// unclamped energy and roughly double the halo radius.
+    pub fn with_format(
+        device: &wgpu::Device,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
         let width = width.max(1);
         let height = height.max(1);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -42,7 +57,7 @@ impl Fbo {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: FBO_FORMAT,
+            format,
             // COPY_SRC/DST so the scene FBO can be snapshotted into a sibling
             // target for `_rt_FullFrameBuffer` reads (feedback-safe post-process
             // layers, docs §6/§11 shadow-copy; the reference blits the scene FBO
