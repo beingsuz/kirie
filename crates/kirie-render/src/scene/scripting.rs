@@ -9,17 +9,18 @@
 //! [`kirie_script::SceneOp`]s + property results *out*, translating them into
 //! [`PropUpdate`]s the render loop applies to its live objects.
 //!
-//! # Scope (v1 slice)
+//! # Scope
 //!
-//! Only the object-leaf properties that flow into the per-object builtin
-//! uniforms (`g_Alpha`, `g_Brightness`, `g_Color`) and object visibility, plus
-//! text content, are wired back. Transform ops (`origin`/`scale`/`angles`),
-//! camera transforms, particle rate and `createLayer`/`sortLayer` are collected
-//! but not yet applied — they require a geometry/scene rebuild the 2D
-//! compositor does not do per-frame (tracked as a gap, see the crate report).
-//! An input pointer position from the platform is not delivered to the
-//! [`kirie_platform::Renderer`] trait yet (`render(dt)` only), so scripts read a
-//! centered pointer until that hook exists (T26).
+//! The object-leaf properties that flow into the per-object builtin uniforms
+//! (`g_Alpha`, `g_Brightness`, `g_Color`), object visibility and text content
+//! are wired back, plus: runtime layers (`createLayer` + transform/color ops
+//! driving their solid quads) and the runtime camera override
+//! (`setCameraTransforms` → the perspective camera 3D models re-read each
+//! frame; the 2D ortho screen MVP is untouched, reference `Camera.h:24-26`).
+//! `setParent`/`sortLayer` render-side application is the remaining gap (see
+//! `process_output`). Scene-object transform ops (`origin`/`scale`/`angles` on
+//! *baked* objects) still require a geometry rebuild the 2D compositor does not
+//! do per-frame (tracked).
 
 use std::collections::BTreeMap;
 
@@ -94,6 +95,50 @@ pub struct PropUpdate {
     pub value: ScriptValue,
 }
 
+/// The merged runtime camera override a frame's `thisScene.setCameraTransforms`
+/// calls produced (reference `scene_set_camera_transforms`,
+/// `Scripting/SceneObject.cpp:261-286`): each field is independent — the
+/// reference only writes the members present on the argument object, so a
+/// partial call leaves the others at their current (possibly earlier-overridden)
+/// value. Multiple calls in one tick merge last-wins per field, exactly as the
+/// reference's sequential setter calls would.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CameraOp {
+    /// New eye position, if overridden.
+    pub eye: Option<[f32; 3]>,
+    /// New look-at center, if overridden.
+    pub center: Option<[f32; 3]>,
+    /// New up vector, if overridden.
+    pub up: Option<[f32; 3]>,
+    /// New vertical fov (degrees), if overridden.
+    pub fov: Option<f32>,
+}
+
+/// Merge one `SetCameraTransforms` op into the pending override (last-wins per
+/// field — mirrors the reference applying each present member immediately,
+/// `SceneObject.cpp:272-286`).
+fn merge_camera(
+    slot: &mut Option<CameraOp>,
+    eye: Option<[f32; 3]>,
+    center: Option<[f32; 3]>,
+    up: Option<[f32; 3]>,
+    fov: Option<f32>,
+) {
+    let dst = slot.get_or_insert_with(CameraOp::default);
+    if eye.is_some() {
+        dst.eye = eye;
+    }
+    if center.is_some() {
+        dst.center = center;
+    }
+    if up.is_some() {
+        dst.up = up;
+    }
+    if fov.is_some() {
+        dst.fov = fov;
+    }
+}
+
 /// The per-scene script host: the engine plus the frame snapshot it re-marshals
 /// each tick.
 pub struct ScriptHost {
@@ -115,6 +160,14 @@ pub struct ScriptHost {
     /// Runtime layers created by scripts this session (`thisScene.createLayer`),
     /// drained by the renderer via [`Self::take_created`]: (synthetic id, path).
     created: Vec<(i64, String)>,
+    /// Pending runtime camera override (`thisScene.setCameraTransforms`),
+    /// merged across the tick's ops, drained via [`Self::take_camera`].
+    camera_op: Option<CameraOp>,
+    /// True when [`Self::scene`] changed since the retained frame last copied it
+    /// (a script fov override — reference `getCameraTransforms` reports the
+    /// overridden fov via `getFov()`, `SceneObject.cpp:257`): the per-tick
+    /// refresh must re-clone the scene state.
+    scene_dirty: bool,
     /// The retained [`HostFrame`] recycled across ticks: sent boxed to the
     /// script thread and handed back with the output
     /// ([`ScriptEngine::tick_reuse`]), so the audio band buffers, the layer
@@ -229,6 +282,8 @@ impl ScriptHost {
             res: [res.0 as f32, res.1 as f32],
             elapsed: 0.0,
             created: Vec::new(),
+            camera_op: None,
+            scene_dirty: false,
             frame: None,
             user_props_dirty: false,
         })
@@ -251,10 +306,11 @@ impl ScriptHost {
             Some(f) => f,
             None => {
                 let mut f = Box::new(HostFrame::default());
-                // Static for the scene's lifetime — set once, never refreshed.
+                // Refreshed below only when dirtied (fov override / setProperty).
                 f.scene = self.scene.clone();
                 f.user_props = self.user_props.clone();
                 self.user_props_dirty = false;
+                self.scene_dirty = false;
                 f
             }
         };
@@ -293,6 +349,11 @@ impl ScriptHost {
         if self.user_props_dirty {
             frame.user_props.clone_from(&self.user_props);
             self.user_props_dirty = false;
+        }
+        // Scene state only changes on a script fov override (see `scene_dirty`).
+        if self.scene_dirty {
+            frame.scene.clone_from(&self.scene);
+            self.scene_dirty = false;
         }
 
         let output = match self.engine.tick_reuse(frame, Vec::new()) {
@@ -370,31 +431,75 @@ impl ScriptHost {
                 });
             }
         }
-        // Imperative scene ops (docs §6.2/§8): leaf writes + runtime layers.
+        // Imperative scene ops (docs §6.2/§8): leaf writes, runtime layers,
+        // camera overrides.
         for op in output.ops {
-            if let SceneOp::CreateLayer { layer_id, path, .. } = &op {
-                self.created.push((*layer_id, path.clone()));
-                continue;
-            }
-            if let SceneOp::SetProperty {
-                layer_id,
-                name,
-                value,
-            } = op
-                && let Some(target) = PropTarget::from_field(&name)
-            {
-                self.record_layer(layer_id, target, &value);
-                updates.push(PropUpdate {
-                    object_id: layer_id,
-                    target,
+            match op {
+                SceneOp::SetProperty {
+                    layer_id,
+                    name,
                     value,
-                });
+                } => {
+                    if let Some(target) = PropTarget::from_field(&name) {
+                        self.record_layer(layer_id, target, &value);
+                        updates.push(PropUpdate {
+                            object_id: layer_id,
+                            target,
+                            value,
+                        });
+                    }
+                }
+                SceneOp::CreateLayer { layer_id, path, .. } => {
+                    // Mirror host.js's synthetic record into the retained layer
+                    // list so next tick's marshal keeps the JS proxy readable
+                    // (the marshal overwrites `__host.layers` wholesale) and the
+                    // new layer enters the sort space at the end — the reference
+                    // appends created layers to the render order (top).
+                    self.layers.push(LayerState {
+                        id: layer_id,
+                        name: path.clone(),
+                        origin: Some([0.0; 3]),
+                        scale: Some([1.0; 3]),
+                        angles: Some([0.0; 3]),
+                        visible: Some(true),
+                        alpha: Some(1.0),
+                        color: Some([1.0; 3]),
+                        ..LayerState::default()
+                    });
+                    self.created.push((layer_id, path));
+                }
+                SceneOp::SetCameraTransforms {
+                    eye,
+                    center,
+                    up,
+                    fov,
+                } => {
+                    merge_camera(&mut self.camera_op, eye, center, up, fov);
+                    // `getCameraTransforms` reports the BASE eye/center/up but
+                    // the *overridden* fov (`getBaseEye`/`getFov`,
+                    // `SceneObject.cpp:252-257`) — mirror only fov into the
+                    // scene snapshot scripts read next tick.
+                    if let Some(f) = fov {
+                        self.scene.camera.fov = f;
+                        self.scene.fov = f;
+                        self.scene_dirty = true;
+                    }
+                }
+                // setParent / sortLayer render-side application lands with the
+                // reparent/z-order bridge (tracked gap, see module docs).
+                SceneOp::SetParent { .. } | SceneOp::SortLayer { .. } => {}
             }
-            // Transform / camera / createLayer / sortLayer ops are collected by
-            // the engine but not applied by the 2D compositor yet (see module
-            // docs); dropping them keeps the scene stable rather than diverging.
         }
         updates
+    }
+
+    /// Drain the tick's merged runtime camera override, if any
+    /// (`thisScene.setCameraTransforms`). The renderer applies it to the live
+    /// perspective camera the 3D models re-read every frame; the 2D
+    /// orthographic screen MVP is deliberately untouched (reference
+    /// `Camera.h:24-26`).
+    pub fn take_camera(&mut self) -> Option<CameraOp> {
+        self.camera_op.take()
     }
 
     /// Keep the cached layer snapshot in step with an applied value so next
@@ -527,6 +632,7 @@ fn layer_state(object: &kirie_scene::object::Object) -> LayerState {
 /// Snapshot scene-level read-only members (docs §6.2 `thisScene`).
 fn scene_state(model: &SceneModel) -> SceneState {
     let g = &model.scene.general;
+    let cam = &model.scene.camera;
     SceneState {
         clearcolor: [
             g.clearcolor.value[0],
@@ -547,6 +653,20 @@ fn scene_state(model: &SceneModel) -> SceneState {
         // SceneState reports these as ints (docs §6.2 `thisScene.bloomstrength`).
         bloomstrength: g.bloomstrength.value as i64,
         bloomthreshold: g.bloomthreshold.value as i64,
+        fov: cam.fov.value,
+        nearz: cam.nearz,
+        farz: cam.farz,
+        // The authored (BASE) camera: `getCameraTransforms` must return this
+        // stable base each frame, never a runtime override — a camera-controller
+        // script recomputes from it and would drift if fed its own output
+        // (reference `Camera.h:35-38`, `SceneObject.cpp:252-256`). Only the fov
+        // member tracks the override (`getFov`, `SceneObject.cpp:257`).
+        camera: kirie_script::CameraState {
+            eye: cam.eye,
+            center: cam.center,
+            up: cam.up,
+            fov: cam.fov.value,
+        },
         ..SceneState::default()
     }
 }
@@ -594,5 +714,30 @@ pub fn as_rgb(v: &ScriptValue) -> Option<[f32; 3]> {
         ScriptValue::Vec2(c) => Some([c[0], c[1], 0.0]),
         ScriptValue::Float(f) => Some([*f as f32; 3]),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Partial `setCameraTransforms` calls merge per field, last-wins — the
+    /// reference applies each present member as it lands
+    /// (`SceneObject.cpp:272-286`), so two calls in one tick behave like the
+    /// second overwriting only the fields it names.
+    #[test]
+    fn camera_ops_merge_last_wins_per_field() {
+        let mut slot = None;
+        merge_camera(&mut slot, Some([1.0, 2.0, 3.0]), None, None, Some(60.0));
+        merge_camera(&mut slot, None, Some([4.0, 5.0, 6.0]), None, Some(45.0));
+        assert_eq!(
+            slot,
+            Some(CameraOp {
+                eye: Some([1.0, 2.0, 3.0]),
+                center: Some([4.0, 5.0, 6.0]),
+                up: None,
+                fov: Some(45.0),
+            })
+        );
     }
 }

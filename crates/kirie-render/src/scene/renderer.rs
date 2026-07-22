@@ -735,6 +735,43 @@ impl SceneRenderer {
             })
             .sum()
     }
+
+    /// Drain and apply the script host's non-property scene ops: runtime-layer
+    /// creation (`thisScene.createLayer`) and the runtime camera override
+    /// (`thisScene.setCameraTransforms`). Shared by the per-frame tick and the
+    /// live `setProperty` dispatch (both can run scripts that issue these).
+    fn apply_script_scene_ops(&mut self) {
+        let Some(script) = self.script.as_mut() else {
+            return;
+        };
+        for (id, path) in script.take_created() {
+            tracing::debug!(id, %path, "runtime layer created by script");
+            self.runtime_layers.entry(id).or_default();
+        }
+        if let Some(cam) = script.take_camera() {
+            // Runtime camera override (`scene_set_camera_transforms`,
+            // `Scripting/SceneObject.cpp:261-286`): only the perspective camera
+            // the 3D MODEL objects re-read every draw follows it. The 2D
+            // orthographic screen MVP is deliberately NOT rebuilt — reference
+            // `Camera.h:24-26`: "CModel re-reads getEye/getCenter/getUp/getFov
+            // every frame so it follows these; 2D layers use the orthographic
+            // getLookAt()/getProjection(), which these do NOT touch" (the ortho
+            // lookAt is computed once at construction, `Camera.cpp:14`, and the
+            // setters only store overrides, `Camera.cpp:35-53`).
+            if let Some(e) = cam.eye {
+                self.camera.eye = e;
+            }
+            if let Some(c) = cam.center {
+                self.camera.center = c;
+            }
+            if let Some(u) = cam.up {
+                self.camera.up = u;
+            }
+            if let Some(f) = cam.fov {
+                self.camera.fov.value = f;
+            }
+        }
+    }
 }
 
 /// Scene-build interning table for shader-parameter reflection: shader name →
@@ -1338,25 +1375,25 @@ impl Renderer for SceneRenderer {
         // to the live objects *before* drawing (SPEC.md §V3 — typed ops only,
         // JS never touches these buffers). Frame-callback driven, so an occluded
         // output that gets no callbacks never ticks (V6 groundwork).
-        if let Some(script) = &mut self.script {
-            let updates = script.tick(dt, spectrum.as_deref(), self.pointer);
-            for (id, path) in script.take_created() {
-                tracing::debug!(id, %path, "runtime layer created by script");
-                self.runtime_layers.entry(id).or_default();
-            }
-            if !updates.is_empty() {
-                // Keep the ancestor-visibility map live so a script hiding/showing
-                // a group also gates/ungates its descendants (docs §7.1).
-                for u in &updates {
-                    if matches!(u.target, PropTarget::Visible)
-                        && let kirie_script::ScriptValue::Bool(v) = &u.value
-                    {
-                        self.visible_by_id.insert(u.object_id, *v);
-                    }
+        let updates = match &mut self.script {
+            Some(script) => script.tick(dt, spectrum.as_deref(), self.pointer),
+            None => Vec::new(),
+        };
+        // Scene ops (createLayer/camera/…) first: a layer created this tick must
+        // exist before its first-frame property updates route to it.
+        self.apply_script_scene_ops();
+        if !updates.is_empty() {
+            // Keep the ancestor-visibility map live so a script hiding/showing
+            // a group also gates/ungates its descendants (docs §7.1).
+            for u in &updates {
+                if matches!(u.target, PropTarget::Visible)
+                    && let kirie_script::ScriptValue::Bool(v) = &u.value
+                {
+                    self.visible_by_id.insert(u.object_id, *v);
                 }
-                apply_runtime_updates(&mut self.runtime_layers, &updates);
-                apply_script_updates(&mut self.items, &updates);
             }
+            apply_runtime_updates(&mut self.runtime_layers, &updates);
+            apply_script_updates(&mut self.items, &updates);
         }
 
         // Recompute the blit UV window on resize (docs §4; cached like the
@@ -1832,10 +1869,9 @@ impl Renderer for SceneRenderer {
                 self.visible_by_id.insert(u.object_id, *v);
             }
         }
-        for (id, path) in self.script.as_mut().map(|s| s.take_created()).unwrap_or_default() {
-            tracing::debug!(id, %path, "runtime layer created by script");
-            self.runtime_layers.entry(id).or_default();
-        }
+        // A change handler may also create layers / drive the camera / reorder
+        // — the same scene-op drain as the per-frame tick.
+        self.apply_script_scene_ops();
         if !updates.is_empty() {
             apply_runtime_updates(&mut self.runtime_layers, &updates);
             apply_script_updates(&mut self.items, &updates);
