@@ -163,6 +163,9 @@ pub struct ScriptHost {
     /// Pending runtime camera override (`thisScene.setCameraTransforms`),
     /// merged across the tick's ops, drained via [`Self::take_camera`].
     camera_op: Option<CameraOp>,
+    /// True when a `sortLayer` op reordered [`Self::layers`] since the renderer
+    /// last drained the order via [`Self::take_layer_order`].
+    order_dirty: bool,
     /// True when [`Self::scene`] changed since the retained frame last copied it
     /// (a script fov override — reference `getCameraTransforms` reports the
     /// overridden fov via `getFov()`, `SceneObject.cpp:257`): the per-tick
@@ -199,7 +202,17 @@ impl ScriptHost {
         // drive (docs §6.2 `getLayer`/`getLayerCount`).
         let mut pending: Vec<Pending> = Vec::new();
         let mut layers: Vec<LayerState> = Vec::with_capacity(model.scene.objects.len());
-        for object in &model.scene.objects {
+        // RENDER order (docs §5.7: declaration order, stable-sorted by
+        // `sortorder` under `general.customsortorder` — same walk as the item
+        // build): the getLayer(i)/sortLayer index space is the scriptable
+        // subset of the *render* order (`CScene::getScriptableLayerIndex`,
+        // CScene.cpp:524-536), not declaration order.
+        let mut render_order: Vec<usize> = (0..model.scene.objects.len()).collect();
+        if model.scene.general.customsortorder {
+            render_order.sort_by_key(|&i| model.scene.objects[i].base.sortorder);
+        }
+        for &oi in &render_order {
+            let object = &model.scene.objects[oi];
             let id = object.base.id;
             layers.push(layer_state(object));
             match &object.kind {
@@ -283,6 +296,7 @@ impl ScriptHost {
             elapsed: 0.0,
             created: Vec::new(),
             camera_op: None,
+            order_dirty: false,
             scene_dirty: false,
             frame: None,
             user_props_dirty: false,
@@ -485,9 +499,17 @@ impl ScriptHost {
                         self.scene_dirty = true;
                     }
                 }
-                // setParent / sortLayer render-side application lands with the
-                // reparent/z-order bridge (tracked gap, see module docs).
-                SceneOp::SetParent { .. } | SceneOp::SortLayer { .. } => {}
+                SceneOp::SortLayer { layer_id, index } => {
+                    // The host's layer list is the authoritative scriptable
+                    // order (getLayer(i) indexes it); apply the reference move
+                    // here, then hand the renderer the new order to mirror.
+                    if sort_layer_apply(&mut self.layers, layer_id, index) {
+                        self.order_dirty = true;
+                    }
+                }
+                // setParent render-side application lands with the reparent
+                // bridge (tracked gap, see module docs).
+                SceneOp::SetParent { .. } => {}
             }
         }
         updates
@@ -500,6 +522,20 @@ impl ScriptHost {
     /// `Camera.h:24-26`).
     pub fn take_camera(&mut self) -> Option<CameraOp> {
         self.camera_op.take()
+    }
+
+    /// Drain the full scriptable-layer order (ids, bottom → top) when a
+    /// `sortLayer` op reordered it this tick; `None` when unchanged. The
+    /// renderer stable-sorts its drawable items to these relative positions and
+    /// renumbers runtime layers, mirroring the reference's single reordered
+    /// `m_objectsByRenderOrder` (`CScene::moveLayerToScriptableIndex`,
+    /// CScene.cpp:538-562).
+    pub fn take_layer_order(&mut self) -> Option<Vec<i64>> {
+        if !self.order_dirty {
+            return None;
+        }
+        self.order_dirty = false;
+        Some(self.layers.iter().map(|l| l.id).collect())
     }
 
     /// Keep the cached layer snapshot in step with an applied value so next
@@ -549,6 +585,27 @@ impl ScriptHost {
             PropTarget::Brightness => {}
         }
     }
+}
+
+/// `thisScene.sortLayer` — the reference's `CScene::moveLayerToScriptableIndex`
+/// (CScene.cpp:538-562) over the script layer list: remove the layer, then
+/// re-insert just before the layer now at `index`; a negative or past-the-end
+/// index appends (top). Every kirie script layer is scriptable, so the
+/// "index-th scriptable layer" of the reference is simply position `index`.
+/// Returns `false` (list untouched) when `layer_id` is unknown — the reference
+/// returns early when the layer is not in its render order (CScene.cpp:540-543).
+fn sort_layer_apply(layers: &mut Vec<LayerState>, layer_id: i64, index: i64) -> bool {
+    let Some(pos) = layers.iter().position(|l| l.id == layer_id) else {
+        return false;
+    };
+    let layer = layers.remove(pos);
+    let at = if index < 0 {
+        layers.len()
+    } else {
+        (index as usize).min(layers.len())
+    };
+    layers.insert(at, layer);
+    true
 }
 
 /// Flatten a `scriptproperties` map to the effective values the engine's
@@ -698,7 +755,7 @@ pub fn as_f32(v: &ScriptValue) -> Option<f32> {
     }
 }
 
-/// Coerce a script value to an RGB triple (color).
+/// Coerce a script value to a vec3 (origin/scale/angles).
 pub fn as_vec3(v: &ScriptValue) -> Option<[f32; 3]> {
     match v {
         ScriptValue::Vec3(a) => Some(*a),
@@ -707,6 +764,7 @@ pub fn as_vec3(v: &ScriptValue) -> Option<[f32; 3]> {
     }
 }
 
+/// Coerce a script value to an RGB triple (color).
 pub fn as_rgb(v: &ScriptValue) -> Option<[f32; 3]> {
     match v {
         ScriptValue::Vec3(c) => Some(*c),
@@ -720,6 +778,69 @@ pub fn as_rgb(v: &ScriptValue) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layer_list(ids: &[i64]) -> Vec<LayerState> {
+        ids.iter()
+            .map(|&id| LayerState {
+                id,
+                ..LayerState::default()
+            })
+            .collect()
+    }
+
+    fn ids(layers: &[LayerState]) -> Vec<i64> {
+        layers.iter().map(|l| l.id).collect()
+    }
+
+    /// Move down: remove-then-insert means the target position is counted in
+    /// the list *without* the moved layer (CScene.cpp:544-561).
+    #[test]
+    fn sort_layer_moves_toward_bottom() {
+        let mut layers = layer_list(&[10, 20, 30, 40]);
+        assert!(sort_layer_apply(&mut layers, 30, 0));
+        assert_eq!(ids(&layers), [30, 10, 20, 40]);
+    }
+
+    #[test]
+    fn sort_layer_moves_toward_top() {
+        let mut layers = layer_list(&[10, 20, 30, 40]);
+        assert!(sort_layer_apply(&mut layers, 10, 2));
+        assert_eq!(ids(&layers), [20, 30, 10, 40]);
+    }
+
+    /// A negative index appends (top) — the reference leaves `insertPos` at
+    /// `end()` (CScene.cpp:546-548).
+    #[test]
+    fn sort_layer_negative_index_appends() {
+        let mut layers = layer_list(&[10, 20, 30]);
+        assert!(sort_layer_apply(&mut layers, 10, -1));
+        assert_eq!(ids(&layers), [20, 30, 10]);
+    }
+
+    /// A past-the-end index appends too — the reference's walk runs out of
+    /// scriptable layers before reaching `index` (CScene.cpp:549-560).
+    #[test]
+    fn sort_layer_past_end_appends() {
+        let mut layers = layer_list(&[10, 20, 30]);
+        assert!(sort_layer_apply(&mut layers, 20, 99));
+        assert_eq!(ids(&layers), [10, 30, 20]);
+    }
+
+    /// An unknown id leaves the list untouched (CScene.cpp:540-543).
+    #[test]
+    fn sort_layer_unknown_id_is_a_noop() {
+        let mut layers = layer_list(&[10, 20, 30]);
+        assert!(!sort_layer_apply(&mut layers, 77, 0));
+        assert_eq!(ids(&layers), [10, 20, 30]);
+    }
+
+    /// Re-inserting at the layer's own position is stable.
+    #[test]
+    fn sort_layer_same_position_is_stable() {
+        let mut layers = layer_list(&[10, 20, 30]);
+        assert!(sort_layer_apply(&mut layers, 20, 1));
+        assert_eq!(ids(&layers), [10, 20, 30]);
+    }
 
     /// Partial `setCameraTransforms` calls merge per field, last-wins — the
     /// reference applies each present member as it lands

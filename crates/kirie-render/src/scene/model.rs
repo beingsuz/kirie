@@ -85,6 +85,8 @@ struct MeshGpu {
 /// One renderable 3D model object: its sub-meshes plus the object transform the
 /// per-frame model matrix is built from (`CModel::computeModelMatrix`).
 pub(super) struct ModelGpu {
+    /// The owning scene-object id (script `sortLayer` targeting).
+    pub(super) id: i64,
     meshes: Vec<MeshGpu>,
     /// Object origin, world space (`origin`).
     origin: [f32; 3],
@@ -289,6 +291,7 @@ pub(super) fn build_model(
         "built 3D model object"
     );
     Some(ModelGpu {
+        id: object.base.id,
         meshes,
         origin,
         scale,

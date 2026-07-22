@@ -171,6 +171,11 @@ struct RuntimeLayer {
     color: [f32; 3],
     alpha: f32,
     visible: bool,
+    /// Draw order among runtime layers (Stage 1b2): creation sequence by
+    /// default (the reference appends created layers to its render order),
+    /// overwritten from the script host's layer order when `sortLayer` moves
+    /// one (`CScene::moveLayerToScriptableIndex`, CScene.cpp:538-562).
+    order: i64,
 }
 
 impl Default for RuntimeLayer {
@@ -182,6 +187,7 @@ impl Default for RuntimeLayer {
             color: [1.0; 3],
             alpha: 1.0,
             visible: true,
+            order: 0,
         }
     }
 }
@@ -237,6 +243,10 @@ pub struct SceneRenderer {
     pointer_last: [f32; 2],
     /// Script-created runtime layers keyed by their synthetic (negative) id.
     runtime_layers: std::collections::HashMap<i64, RuntimeLayer>,
+    /// Next creation-order value for a runtime layer (monotonic; reset above
+    /// the script host's layer count whenever a `sortLayer` renumber lands so
+    /// later creations still draw on top).
+    runtime_seq: i64,
     /// Lazily built solid-quad pipeline + growable vertex buffer for them.
     runtime_pipeline: Option<(wgpu::RenderPipeline, wgpu::Buffer, usize)>,
     /// Eased camera-parallax displacement (`CScene::m_parallaxDisplacement`):
@@ -649,6 +659,7 @@ impl SceneRenderer {
             pointer_last: [0.5, 0.5],
             parallax_disp: [0.0, 0.0],
             runtime_layers: std::collections::HashMap::new(),
+            runtime_seq: 0,
             runtime_pipeline: None,
             text_pipeline,
             scene_fbo,
@@ -746,7 +757,14 @@ impl SceneRenderer {
         };
         for (id, path) in script.take_created() {
             tracing::debug!(id, %path, "runtime layer created by script");
-            self.runtime_layers.entry(id).or_default();
+            // Creation order doubles as the default draw order — the reference
+            // appends created layers to its render order (top).
+            let order = self.runtime_seq;
+            self.runtime_layers.entry(id).or_insert_with(|| RuntimeLayer {
+                order,
+                ..RuntimeLayer::default()
+            });
+            self.runtime_seq += 1;
         }
         if let Some(cam) = script.take_camera() {
             // Runtime camera override (`scene_set_camera_transforms`,
@@ -771,6 +789,41 @@ impl SceneRenderer {
                 self.camera.fov.value = f;
             }
         }
+        if let Some(order) = script.take_layer_order() {
+            // Live z-order (`thisScene.sortLayer` →
+            // `CScene::moveLayerToScriptableIndex`, CScene.cpp:538-562): the
+            // script host maintains the one authoritative layer order; mirror
+            // it here. Drawable items stable-sort to the order's relative
+            // positions (the reference's single reordered render list,
+            // restricted to what this compositor draws) and runtime layers
+            // renumber so Stage 1b2 keeps the same relative order among
+            // themselves. Runtime layers always composite *above* the scene
+            // items regardless (their stage draws after 1b — a tracked
+            // difference from the reference's fully interleaved list).
+            let pos: HashMap<i64, usize> =
+                order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            for (id, layer) in &mut self.runtime_layers {
+                if let Some(&p) = pos.get(id) {
+                    layer.order = p as i64;
+                }
+            }
+            self.runtime_seq = order.len() as i64;
+            // Stable: items absent from the order (impossible for built scene
+            // objects — every object has a script layer) keep relative order.
+            self.items
+                .sort_by_key(|it| pos.get(&item_id(it)).copied().unwrap_or(usize::MAX));
+        }
+    }
+}
+
+/// The scene-object id an item was built from — the handle script ops
+/// (`sortLayer`) target.
+fn item_id(item: &SceneItem) -> i64 {
+    match item {
+        SceneItem::Image(o) => o.id,
+        SceneItem::Particle(p) => p.id,
+        SceneItem::Text(t) => t.id,
+        SceneItem::Model(m) => m.id,
     }
 }
 
@@ -1699,7 +1752,11 @@ impl Renderer for SceneRenderer {
         if self.runtime_layers.values().any(|l| l.visible && l.alpha > 0.0) {
             let (sw, sh) = (self.proj_w as f32, self.proj_h as f32);
             let mut verts: Vec<f32> = Vec::with_capacity(self.runtime_layers.len() * 36);
-            for l in self.runtime_layers.values() {
+            // Draw in z-order, not HashMap order: creation sequence by default,
+            // `sortLayer` overrides (the vertex append order *is* the composite
+            // order — later quads alpha-blend over earlier ones).
+            for id in runtime_draw_order(&self.runtime_layers) {
+                let l = &self.runtime_layers[&id];
                 if !l.visible || l.alpha <= 0.0 {
                     continue;
                 }
@@ -1992,6 +2049,17 @@ fn apply_script_updates(items: &mut [SceneItem], updates: &[PropUpdate]) {
             }
         }
     }
+}
+
+/// Runtime-layer draw order for Stage 1b2, bottom → top: the `order` value
+/// (creation sequence, or the script-host layer-order position after a
+/// `sortLayer`), tie-broken toward creation order — synthetic ids descend from
+/// -1000 as layers are created (host.js `__nextSyntheticId--`), so the larger
+/// id was created earlier and draws first.
+fn runtime_draw_order(layers: &std::collections::HashMap<i64, RuntimeLayer>) -> Vec<i64> {
+    let mut ids: Vec<i64> = layers.keys().copied().collect();
+    ids.sort_by_key(|id| (layers[id].order, std::cmp::Reverse(*id)));
+    ids
 }
 
 /// Apply script updates addressed to runtime layers (synthetic ids from
@@ -2924,6 +2992,42 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Runtime layers draw in creation order by default: synthetic ids descend
+    /// from -1000 as layers are created (host.js `__nextSyntheticId--`), and
+    /// creation assigns ascending `order`, so first-created draws first.
+    #[test]
+    fn runtime_layers_draw_in_creation_order_by_default() {
+        let mut layers = std::collections::HashMap::new();
+        for (i, id) in [-1000i64, -1001, -1002].into_iter().enumerate() {
+            layers.insert(
+                id,
+                RuntimeLayer {
+                    order: i as i64,
+                    ..RuntimeLayer::default()
+                },
+            );
+        }
+        assert_eq!(runtime_draw_order(&layers), [-1000, -1001, -1002]);
+    }
+
+    /// A `sortLayer` renumber overrides creation order; equal orders (never
+    /// produced by the renumber, but reachable via a raw default) tie-break
+    /// toward creation order (larger id first).
+    #[test]
+    fn runtime_layers_draw_in_sorted_order_after_renumber() {
+        let mut layers = std::collections::HashMap::new();
+        for (order, id) in [(5i64, -1000i64), (3, -1001), (4, -1002), (3, -1003)] {
+            layers.insert(
+                id,
+                RuntimeLayer {
+                    order,
+                    ..RuntimeLayer::default()
+                },
+            );
+        }
+        assert_eq!(runtime_draw_order(&layers), [-1001, -1003, -1002, -1000]);
     }
 
     /// The reference's raw screen VP (`Camera.cpp:76-91` + `Camera.cpp:14`),

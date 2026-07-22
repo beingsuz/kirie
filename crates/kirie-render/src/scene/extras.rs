@@ -46,6 +46,8 @@ use super::texture::{GpuTexture, TextureRegistry};
 /// and the static scene view-projection (screen MVP × object model matrix,
 /// folded once — the transform does not animate here, docs §7.3).
 pub struct ParticleGpu {
+    /// The owning scene-object id (script `sortLayer` targeting).
+    pub id: i64,
     /// The CPU particle simulation (advanced per frame by `dt`).
     pub sim: ParticleSim,
     /// The instanced-quad sprite renderer targeting the scene FBO.
@@ -60,6 +62,8 @@ pub struct ParticleGpu {
 /// group (MVP + color uniform, coverage texture + sampler) and the textured quad
 /// (docs §7.4). Draws with [`TextPipeline`].
 pub struct TextGpu {
+    /// The owning scene-object id (script `sortLayer` targeting).
+    pub id: i64,
     /// The per-object bind group (uniform + coverage texture + sampler).
     pub bind: wgpu::BindGroup,
     /// The scene-space quad vertices (4-vertex triangle strip, pos + uv).
@@ -118,6 +122,7 @@ pub fn build_particle(
     let view_projection = matrix::mul(screen_mvp, &model);
 
     Some(ParticleGpu {
+        id: object.base.id,
         sim,
         renderer,
         view_projection,
@@ -358,6 +363,7 @@ pub fn build_text(
         usage: wgpu::BufferUsages::VERTEX,
     });
     Some(TextGpu {
+        id: object.base.id,
         bind,
         vertex_buffer,
         _texture: texture,
