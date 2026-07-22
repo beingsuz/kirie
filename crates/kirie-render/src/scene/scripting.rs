@@ -189,6 +189,10 @@ pub struct ScriptHost {
     /// copied it (a live `setProperty`) — the only time the per-tick refresh
     /// must re-clone the map.
     user_props_dirty: bool,
+    /// Wall-clock instant of the previous tick, for the `dt == 0` frametime
+    /// fallback (see [`Self::tick`]). Starts at host creation, mirroring the
+    /// reference where the first frame's `frametime` is the startup elapsed.
+    last_tick: std::time::Instant,
 }
 
 impl ScriptHost {
@@ -307,6 +311,7 @@ impl ScriptHost {
             scene_dirty: false,
             frame: None,
             user_props_dirty: false,
+            last_tick: std::time::Instant::now(),
         })
     }
 
@@ -336,7 +341,22 @@ impl ScriptHost {
             }
         };
         frame.runtime = self.elapsed;
-        frame.frametime = f64::from(dt);
+        // Reference `engine.frametime` is `g_Time - g_TimeLast` off the wall
+        // clock (WallpaperApplication.cpp:900-908, EngineObject.cpp:76-78), so
+        // it is positive even on the first frame (startup elapsed) and on
+        // re-render ticks the platform drives with `dt = 0` (live screenshot
+        // capture). A literal 0 NaN-poisons scripts that normalize by
+        // `frametime * (1 / frametime)` (Starscape's camera driver dies from
+        // frame 2 onward), so fall back to real elapsed time when the render
+        // loop didn't provide a delta.
+        let now = std::time::Instant::now();
+        let wall = now.duration_since(self.last_tick).as_secs_f64();
+        self.last_tick = now;
+        frame.frametime = if dt > 0.0 {
+            f64::from(dt)
+        } else {
+            wall.max(1e-4)
+        };
         frame.now = self.elapsed * 1000.0;
         frame.res_x = f64::from(self.res[0]);
         frame.res_y = f64::from(self.res[1]);

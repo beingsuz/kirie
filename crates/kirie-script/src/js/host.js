@@ -251,17 +251,32 @@ var __scene = {
 globalThis.thisScene = __scene;
 
 // ---- createScriptProperties (docs §5.5, property-script variant) ----------
-// Descriptors are ignored; values come only from the module's JSON
-// scriptproperties (injected as __host.scriptProps before module evaluation).
+// Descriptor defaults seed each property; the module's JSON scriptproperties
+// (injected as __host.scriptProps before evaluation) override them. A combo
+// descriptor without a `value` defaults to its first option, matching the
+// reference editor's behavior.
 globalThis.createScriptProperties = function () {
   var captured = __host.scriptProps || {};
+  var defaults = {};
+  function def(o) {
+    if (!o || typeof o.name !== 'string') return builder;
+    var v = o.value;
+    if (v === undefined && o.options && o.options.length) v = o.options[0].value;
+    defaults[o.name] = v;
+    return builder;
+  }
   var builder = {
-    addSlider: function () { return builder; },
-    addCheckbox: function () { return builder; },
-    addCombo: function () { return builder; },
-    addColor: function () { return builder; },
-    addText: function () { return builder; },
-    finish: function () { var o = {}; for (var k in captured) o[k] = captured[k]; return o; },
+    addSlider: def,
+    addCheckbox: def,
+    addCombo: def,
+    addColor: def,
+    addText: def,
+    finish: function () {
+      var o = {};
+      for (var k in defaults) o[k] = defaults[k];
+      for (var k2 in captured) o[k2] = captured[k2];
+      return o;
+    },
   };
   return builder;
 };
@@ -289,7 +304,7 @@ globalThis.__createLayerScript = function (handle, source, props, text) {
     + 'var thisLayer = { text: String(globalThis.__layerSeedText || "") };\n'
     + 'var thisScene = { get time(){ var c = globalThis.__sceneCtx; return c?c.time:0; }, get currentTime(){ var c = globalThis.__sceneCtx; return c?c.time:0; }, get dt(){ var c = globalThis.__sceneCtx; return c?c.dt:0; }, get fps(){ var c = globalThis.__sceneCtx; return c?c.fps:60; } };\n'
     + 'var engine = { get frametime(){ var c = globalThis.__sceneCtx; return c?c.dt:0; }, get time(){ var c = globalThis.__sceneCtx; return c?c.time:0; } };\n'
-    + 'function createScriptProperties(){ var b = { addSlider:add, addCheckbox:add, addCombo:add, addColor:add, addText:add, finish:function(){ return __props; } }; function add(o){ if (o && !(o.name in __props)) __props[o.name] = o.value; return b; } return b; }\n'
+    + 'function createScriptProperties(){ var b = { addSlider:add, addCheckbox:add, addCombo:add, addColor:add, addText:add, finish:function(){ return __props; } }; function add(o){ if (o && !(o.name in __props)) { var v = o.value; if (v === undefined && o.options && o.options.length) v = o.options[0].value; __props[o.name] = v; } return b; } return b; }\n'
     + stripped + '\n'
     + 'globalThis.__host.textLayers[__id] = { thisLayer: thisLayer, thisScene: thisScene, _init: (typeof init === "function")?init:null, _destroy: (typeof destroy === "function")?destroy:null, _tick: (typeof update === "function")?function(){ var r = update(thisLayer.text); if (typeof r === "string") thisLayer.text = r; }:null, _inited:false };\n'
     + '})();';
