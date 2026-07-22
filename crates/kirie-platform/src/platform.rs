@@ -260,7 +260,15 @@ impl PlatformState {
                     Some(key) => {
                         let name = self.outputs[idx].name.clone();
                         if let Some(format) = self.outputs[idx].format {
+                            // Cap the stash at one preloaded wallpaper per
+                            // output: each entry holds a fully-built renderer
+                            // (GPU textures + CPU state), and the disk caches
+                            // (bundle + shaders) make a cold rebuild cheap —
+                            // hoarding old builds is RAM/VRAM the compositor
+                            // never sees again. Newest wins.
+                            self.preloaded.retain(|(n, _), _| *n != name);
                             self.preloaded.insert((name, key), (format, renderer));
+                            kirie_bake::trim_heap();
                         }
                     }
                     None => self.install_renderer(idx, renderer),
@@ -373,6 +381,11 @@ impl PlatformState {
             ctx.frame_pending = true;
             ctx.wl_surface().commit();
         }
+        // The old renderer just freed its CPU-side state (decoded assets,
+        // script heaps, staging buffers) — return those pages to the kernel
+        // now rather than letting glibc hoard them until the next build. GPU
+        // resources already unmapped via the wgpu drop chain above.
+        kirie_bake::trim_heap();
         tracing::info!(output = %ctx.name, "wallpaper swapped in");
     }
 

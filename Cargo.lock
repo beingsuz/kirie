@@ -2262,6 +2262,7 @@ name = "kirie-platform"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "kirie-bake",
  "pollster",
  "raw-window-handle",
  "smithay-client-toolkit",

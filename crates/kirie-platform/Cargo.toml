@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Wayland presentation layer: layer-shell surfaces per output, wgpu integration, frame-callback driven render loop"
 
 [dependencies]
+kirie-bake = { path = "../kirie-bake" }
 smithay-client-toolkit = { workspace = true }
 wayland-client = { workspace = true }
 wgpu = { workspace = true }
