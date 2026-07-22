@@ -293,14 +293,19 @@ pub const COLOR_BLEND_MATERIAL: &str = "materials/util/effectpassthrough.json";
 ///
 /// `visible` is the image's resolved visibility (a hidden image still plans
 /// nothing). `passthrough` is the model's `passthrough` flag: a passthrough
-/// image whose passes are all trivial is the §7.1 early-out. `color_blend` is
-/// the loaded [`COLOR_BLEND_MATERIAL`], only consulted when the image's
-/// `colorBlendMode` is non-default; `None` (builtin asset unavailable) degrades
-/// to no extra pass (SPEC.md §V9).
+/// image whose passes are all trivial is the §7.1 early-out. `offscreen_donor`
+/// is the §5.6 dependency-donor flag: the chain ends in the image's composite
+/// FBO instead of the scene, so the §7.1 blend relocation below suppresses the
+/// layer's material blending entirely — the composite stays a straight-alpha
+/// replace chain for dependents to sample. `color_blend` is the loaded
+/// [`COLOR_BLEND_MATERIAL`], only consulted when the image's `colorBlendMode`
+/// is non-default; `None` (builtin asset unavailable) degrades to no extra
+/// pass (SPEC.md §V9).
 #[must_use]
 pub fn plan_image(
     image: &ImageObject,
     visible: bool,
+    offscreen_donor: bool,
     color_blend: Option<&kirie_scene::material::Material>,
 ) -> ImagePlan {
     if !visible {
@@ -363,11 +368,29 @@ pub fn plan_image(
     // (`m_hasPuppetMesh`). Planning is pure and cannot know load success, so
     // kirie applies that force in the renderer (`effective_blending`), paired
     // with blend.rs's coverage-correct alpha factor.
+    //
+    // Dependency-donor exception (docs §5.6): the relocated blending is the
+    // layer's *scene-composite* blending — it belongs on the pass that draws
+    // into the scene FBO (`CImage.cpp:843-846` reroutes exactly that pass).
+    // A donor never scene-draws (`shouldRenderFinalPass`, `CImage.cpp:883-885`,
+    // keeps an invisible image's last pass in the ping-pong), so its material
+    // blending must NOT be installed there: the composite must hold straight
+    // (rgb, a) for dependents' blend effects, which mix with weight = sampled
+    // alpha (`shaders/effects/blend.frag`: `blend = blendColors.a`). A
+    // Translucent write into the cleared-transparent composite would store
+    // premultiplied `a·rgb` and square the weight at anti-aliased rims —
+    // `out = (1−a)·bg + a²·rgb` instead of the straight-alpha over
+    // (2155933185's planet-disc donors). A single-pass donor's only pass IS
+    // that composite copy, so its material blending is suppressed the same way.
     if passes.len() > 1 {
         let first_blend = passes[0].pass.blending;
         passes[0].pass.blending = Blending::Normal;
-        let last = passes.len() - 1;
-        passes[last].pass.blending = first_blend;
+        if !offscreen_donor {
+            let last = passes.len() - 1;
+            passes[last].pass.blending = first_blend;
+        }
+    } else if offscreen_donor {
+        passes[0].pass.blending = Blending::Normal;
     }
 
     // Wire inputs/outputs: ping-pong across two image FBOs, last pass → scene.
@@ -476,7 +499,7 @@ mod tests {
     #[test]
     fn hidden_image_plans_nothing() {
         let img = image(vec![pass("effect", Blending::Normal)]);
-        assert!(plan_image(&img, false, None).passes.is_empty());
+        assert!(plan_image(&img, false, false, None).passes.is_empty());
     }
 
     #[test]
@@ -486,7 +509,7 @@ mod tests {
         // identity — the reference never renders it (would blit a solid block).
         let mut img = image(vec![pass("passthrough", Blending::Translucent)]);
         img.model = Some(passthrough_model());
-        assert!(plan_image(&img, true, None).passes.is_empty());
+        assert!(plan_image(&img, true, false, None).passes.is_empty());
     }
 
     #[test]
@@ -523,20 +546,20 @@ mod tests {
                 }],
             }),
         }];
-        assert_eq!(plan_image(&img, true, None).passes.len(), 2);
+        assert_eq!(plan_image(&img, true, false, None).passes.len(), 2);
     }
 
     #[test]
     fn image_without_material_plans_nothing() {
         let mut img = image(vec![]);
         img.material = None;
-        assert!(plan_image(&img, true, None).passes.is_empty());
+        assert!(plan_image(&img, true, false, None).passes.is_empty());
     }
 
     #[test]
     fn single_pass_composites_into_scene_from_layer() {
         let img = image(vec![pass("passthrough", Blending::Translucent)]);
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes.len(), 1);
         let p = &plan.passes[0];
         assert_eq!(p.input, PassInput::Layer);
@@ -553,7 +576,7 @@ mod tests {
             pass("b", Blending::Normal),
             pass("c", Blending::Normal),
         ]);
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes.len(), 3);
 
         // First pass reads the layer, copy-space, writes fbo 0.
@@ -635,7 +658,7 @@ mod tests {
             command_epass(PassCommand::Copy, "_rt_FullCompoBuffer2", "_rt_FullCompoBuffer1"),
             material_epass("motionblur_combine", None),
         ])];
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes.len(), 4, "base + accumulate + copy + combine");
         let copy = &plan.passes[2];
         assert_eq!(copy.shader, COPY_COMMAND_SHADER);
@@ -659,7 +682,7 @@ mod tests {
             "_rt_SmokeDye1",
             "_rt_SmokeDye2",
         )])];
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes.len(), 1, "swap contributes no pass");
     }
 
@@ -684,7 +707,7 @@ mod tests {
         };
         effect.passes = vec![ov(1), ov(2)];
         img.effects = vec![effect];
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes.len(), 4);
         assert_eq!(plan.passes[1].pass.combos.get("MARK"), Some(&1));
         assert_eq!(
@@ -712,7 +735,7 @@ mod tests {
         // so the extra pass carries the layer's blending into the scene.
         let mut img = image(vec![pass("base", Blending::Additive)]);
         img.color_blend_mode = UserSetting::literal(9);
-        let plan = plan_image(&img, true, Some(&effectpassthrough()));
+        let plan = plan_image(&img, true, false, Some(&effectpassthrough()));
         assert_eq!(plan.passes.len(), 2, "base copy + colorBlendMode pass");
         let last = &plan.passes[1];
         assert_eq!(last.shader, "genericimage3");
@@ -734,7 +757,7 @@ mod tests {
         let mut img = image(vec![pass("base", Blending::Normal)]);
         img.color_blend_mode = UserSetting::literal(2);
         img.effects = vec![effect_of(vec![material_epass("tint", None)])];
-        let plan = plan_image(&img, true, Some(&effectpassthrough()));
+        let plan = plan_image(&img, true, false, Some(&effectpassthrough()));
         assert_eq!(plan.passes.len(), 3);
         assert_eq!(plan.passes[1].shader, "tint");
         assert_eq!(plan.passes[2].shader, "genericimage3");
@@ -746,7 +769,7 @@ mod tests {
         // Mode 0 is the default — no extra pass even with the material at hand
         // (`CImage.cpp:770` gates on `getInt() > 0`).
         let img = image(vec![pass("base", Blending::Normal)]);
-        let plan = plan_image(&img, true, Some(&effectpassthrough()));
+        let plan = plan_image(&img, true, false, Some(&effectpassthrough()));
         assert_eq!(plan.passes.len(), 1);
     }
 
@@ -756,7 +779,7 @@ mod tests {
         // skip-and-continue — the image still renders, just ungraded.
         let mut img = image(vec![pass("base", Blending::Normal)]);
         img.color_blend_mode = UserSetting::literal(4);
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes.len(), 1);
     }
 
@@ -768,7 +791,7 @@ mod tests {
             pass("a", Blending::Additive),
             pass("b", Blending::Translucent),
         ]);
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes[0].blending, Blending::Normal, "first forced Normal");
         assert_eq!(
             plan.passes[1].blending,
@@ -799,8 +822,40 @@ mod tests {
             height: None,
             puppet: Some("models/女_puppet.mdl".into()),
         });
-        let plan = plan_image(&img, true, None);
+        let plan = plan_image(&img, true, false, None);
         assert_eq!(plan.passes[0].blending, Blending::Normal, "no puppet exception");
         assert_eq!(plan.passes[1].blending, Blending::Translucent, "relocated to last");
+    }
+
+    #[test]
+    fn donor_blend_is_not_installed_on_last_pass() {
+        // Docs §5.6: a dependency donor's last pass stays in the ping-pong
+        // (the reference's `shouldRenderFinalPass`, `CImage.cpp:883-885`), so
+        // the §7.1 relocation must not install the layer blending there — the
+        // composite keeps straight (rgb, a) for dependents' blend effects
+        // (2155933185's planet-disc donors: base Translucent + scroll +
+        // transform; a Translucent last write would premultiply the rim).
+        let img = image(vec![
+            pass("base", Blending::Translucent),
+            pass("scroll", Blending::Normal),
+            pass("transform", Blending::Normal),
+        ]);
+        let plan = plan_image(&img, true, true, None);
+        assert_eq!(plan.passes[0].blending, Blending::Normal, "copy is replace");
+        assert_eq!(
+            plan.passes[2].blending,
+            Blending::Normal,
+            "layer blending suppressed: the composite stays straight-alpha"
+        );
+    }
+
+    #[test]
+    fn single_pass_donor_copy_is_replace() {
+        // A single-pass donor's only pass IS the composite copy — its material
+        // blending (the would-be scene blending) is suppressed to Normal so
+        // the composite holds the straight layer texture.
+        let img = image(vec![pass("base", Blending::Translucent)]);
+        let plan = plan_image(&img, true, true, None);
+        assert_eq!(plan.passes[0].blending, Blending::Normal);
     }
 }

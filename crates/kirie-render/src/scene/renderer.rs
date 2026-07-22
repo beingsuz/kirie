@@ -797,7 +797,7 @@ fn build_object(
         .flatten()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .map(|v| kirie_scene::material::Material::from_value(&v));
-    let chain = plan::plan_image(image, visible, color_blend.as_ref());
+    let chain = plan::plan_image(image, visible, offscreen_donor, color_blend.as_ref());
     if chain.passes.is_empty() {
         return None;
     }
