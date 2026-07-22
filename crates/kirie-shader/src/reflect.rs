@@ -9,9 +9,11 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// A scalar/vector uniform default drawn from a `// {json}` annotation
 /// (docs/shader-pipeline.md §2.2). Encodes the parsed default value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ParamDefault {
     /// `float`/`int` scalar default (docs/shader-pipeline.md §2.2 number/string case).
     Scalar(f64),
@@ -21,7 +23,7 @@ pub enum ParamDefault {
 }
 
 /// The declared GLSL type of a bindable parameter (docs/shader-pipeline.md §2.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParamType {
     /// `float`
     Float,
@@ -38,7 +40,7 @@ pub enum ParamType {
 /// A non-sampler bindable parameter: a `uniform` with a `// {json}` annotation
 /// carrying a `material` link (docs/shader-pipeline.md §2.2). Only uniforms with a
 /// `material` key are registered by the reference (`ShaderUnit.cpp:690-695`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Parameter {
     /// The GLSL uniform name, e.g. `g_Brightness`.
     pub name: String,
@@ -56,7 +58,7 @@ pub struct Parameter {
 /// declaration (docs/shader-pipeline.md §2.2, §8.2). The combined GL sampler is
 /// split into a separate texture + sampler binding pair for wgpu
 /// (docs/shader-pipeline.md §9.2.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SamplerSlot {
     /// GLSL uniform name, e.g. `g_Texture0`.
     pub name: String,
@@ -80,7 +82,7 @@ pub struct SamplerSlot {
 /// A vertex attribute input (`attribute` in the raw dialect; docs/shader-pipeline.md
 /// §2, §8.2). Wallpaper Engine binds exactly `a_Position`/`a_TexCoord`
 /// (`CPass.cpp:715-718`) but the reflection records whatever the unit declares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VertexAttribute {
     /// Attribute name, e.g. `a_Position`.
     pub name: String,
@@ -89,7 +91,7 @@ pub struct VertexAttribute {
 }
 
 /// Reflection captured during translation, keyed by source name.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Reflection {
     /// Loose engine/parameter uniforms packed into the synthesized `_WEGlobals`
     /// uniform block (docs/shader-pipeline.md §9.2.2), in declaration order. The

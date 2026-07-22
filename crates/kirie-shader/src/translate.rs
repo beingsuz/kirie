@@ -161,6 +161,93 @@ fn try_shaderc(stage: Stage, filename: &str, src: &str) -> Result<naga::Module, 
     naga::front::spv::parse_u8_slice(artifact.as_binary_u8(), &spv_opts).map_err(|e| format!("{e:?}"))
 }
 
+/// A fully translated unit cached against the RAW inputs: skipping not just
+/// glslang/naga (the module cache below) but preprocessing + modernization +
+/// validation entirely on warm loads. `includes` records every `#include`
+/// body's content hash observed at build; a hit re-resolves each and compares,
+/// so an edited header is a clean miss (the depfile approach).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct UnitEntry {
+    includes: Vec<(String, [u8; 32])>,
+    glsl: String,
+    path: crate::TranslatePath,
+    reflection: crate::Reflection,
+    module: naga::Module,
+}
+
+/// Cache key over the RAW translate() inputs: source, stage, canonicalized
+/// [`crate::ShaderInputs`] and the translator/format versions. Include bodies
+/// are deliberately NOT keyed (unknowable before preprocessing) — they are
+/// verified per entry via the recorded hashes.
+pub(crate) fn unit_cache_key(stage: Stage, source: &str, inputs: &crate::ShaderInputs) -> String {
+    const UNIT_FORMAT: u32 = 1;
+    let mut h = blake3::Hasher::new();
+    h.update(source.as_bytes());
+    h.update(&[match stage {
+        Stage::Vertex => 0u8,
+        Stage::Fragment => 1u8,
+    }]);
+    for (k, v) in &inputs.combos {
+        h.update(k.as_bytes());
+        h.update(&v.to_le_bytes());
+        h.update(&[0xfe]);
+    }
+    h.update(&[0xfd]);
+    for (k, v) in &inputs.override_combos {
+        h.update(k.as_bytes());
+        h.update(&v.to_le_bytes());
+        h.update(&[0xfe]);
+    }
+    h.update(&[0xfd]);
+    for slot in &inputs.populated_texture_slots {
+        h.update(&slot.to_le_bytes());
+    }
+    h.update(&crate::TRANSLATOR_VERSION.to_le_bytes());
+    h.update(&UNIT_FORMAT.to_le_bytes());
+    h.finalize().to_hex().to_string()
+}
+
+/// Load a cached unit for `key`, verifying every recorded include body still
+/// resolves to the same content. `None` ⇒ full translate.
+pub(crate) fn unit_cache_load(
+    key: &str,
+    resolver: &dyn crate::IncludeResolver,
+) -> Option<crate::TranslatedShader> {
+    let bytes = std::fs::read(spirv_cache_dir()?.join(format!("{key}.tng"))).ok()?;
+    let entry: UnitEntry = bincode::deserialize(&bytes).ok()?;
+    for (name, hash) in &entry.includes {
+        let body = resolver.resolve(name)?;
+        if blake3::hash(body.as_bytes()).as_bytes() != hash {
+            return None;
+        }
+    }
+    Some(crate::TranslatedShader {
+        module: entry.module,
+        reflection: entry.reflection,
+        path: entry.path,
+        glsl: entry.glsl,
+    })
+}
+
+/// Store a translated unit for `key` (best-effort, atomic).
+pub(crate) fn unit_cache_store(
+    key: &str,
+    includes: Vec<(String, [u8; 32])>,
+    ts: &crate::TranslatedShader,
+) {
+    let entry = UnitEntry {
+        includes,
+        glsl: ts.glsl.clone(),
+        path: ts.path,
+        reflection: ts.reflection.clone(),
+        module: ts.module.clone(),
+    };
+    if let (Ok(bytes), Some(dir)) = (bincode::serialize(&entry), spirv_cache_dir()) {
+        write_cache_atomic(&dir.join(format!("{key}.tng")), &bytes);
+        maybe_prune_cache(&dir);
+    }
+}
+
 /// Cache key for a shader's serialized naga module: `blake3(modernized ‖ stage ‖
 /// TRANSLATOR_VERSION ‖ CACHE_FORMAT)`. Bumping [`crate::TRANSLATOR_VERSION`] or
 /// the format tag invalidates every entry; a different shader or stage never
@@ -215,7 +302,7 @@ fn maybe_prune_cache(dir: &std::path::Path) {
     };
     let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "nga"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == "nga" || x == "tng"))
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             Some((e.path(), m.len(), m.modified().ok()?))

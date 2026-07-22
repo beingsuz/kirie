@@ -87,7 +87,7 @@ impl Stage {
 
 /// Which frontend produced the module for a given shader (reported per SPEC/task
 /// requirement so the render phase knows the translation route).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TranslatePath {
     /// naga's pure-Rust GLSL frontend accepted the modernized source directly.
     NagaGlsl,
@@ -239,9 +239,44 @@ pub fn translate(
     resolver: &dyn IncludeResolver,
     inputs: &ShaderInputs,
 ) -> Result<TranslatedShader, TranslateError> {
-    let assembled = preprocess::preprocess(stage, filename, source, resolver, inputs)?;
+    // Warm path: a unit cached against the RAW inputs skips preprocessing,
+    // modernization AND translation. Include bodies are verified against the
+    // hashes recorded at build time (see translate::UnitEntry), so an edited
+    // header is a clean miss, never a stale hit.
+    let unit_key = translate::unit_cache_key(stage, source, inputs);
+    if let Some(ts) = translate::unit_cache_load(&unit_key, resolver) {
+        return Ok(ts);
+    }
+
+    // Cold path — record every include body the preprocessor pulls so the
+    // stored unit can be verified on later loads.
+    let recording = RecordingResolver {
+        inner: resolver,
+        seen: std::cell::RefCell::new(Vec::new()),
+    };
+    let assembled = preprocess::preprocess(stage, filename, source, &recording, inputs)?;
     let (glsl, reflection) = modernize::modernize(stage, assembled);
-    translate::translate(stage, filename, glsl, reflection)
+    let out = translate::translate(stage, filename, glsl, reflection)?;
+    translate::unit_cache_store(&unit_key, recording.seen.into_inner(), &out);
+    Ok(out)
+}
+
+/// Wraps an [`IncludeResolver`], recording `(name, blake3(body))` for every
+/// successful resolve — the dependency set the unit cache verifies on load.
+struct RecordingResolver<'a> {
+    inner: &'a dyn IncludeResolver,
+    seen: std::cell::RefCell<Vec<(String, [u8; 32])>>,
+}
+
+impl IncludeResolver for RecordingResolver<'_> {
+    fn resolve(&self, include_name: &str) -> Option<String> {
+        let body = self.inner.resolve(include_name)?;
+        let mut seen = self.seen.borrow_mut();
+        if !seen.iter().any(|(n, _)| n == include_name) {
+            seen.push((include_name.to_owned(), *blake3::hash(body.as_bytes()).as_bytes()));
+        }
+        Some(body)
+    }
 }
 
 #[cfg(test)]
