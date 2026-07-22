@@ -27,14 +27,17 @@ runs:
         DEBIAN_FRONTEND: noninteractive
         PIP_NO_CACHE_DIR: "1"
       run: |
-        apt-get update
-        apt-get install -y --no-install-recommends \
+        SUDO=""; [ "$(id -u)" != 0 ] && SUDO=sudo
+        $SUDO apt-get update
+        $SUDO apt-get install -y --no-install-recommends \
           build-essential clang ninja-build nasm git curl ca-certificates \
           pkg-config python3 python3-pip binutils \
           libasound2-dev libpulse-dev \
           libxcb1-dev libwayland-dev libxkbcommon-dev libx11-dev libdbus-1-dev \
           ${{ inputs.extra-apt }}
-        pip3 install "cmake<4"
+        pip3 install --user "cmake<4"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
         cmake --version
 
     - name: Install Rust (rustup, current stable)

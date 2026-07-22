@@ -28,11 +28,14 @@ name: Release
 # Wallpaper Engine is the native app. A Windows port would be a new platform
 # backend, not a packaging change.
 #
-# Job shape: default + web-cef build IN ONE JOB (same debian:11 container,
-# same target dir - the web build reuses the whole dependency graph incl. the
-# from-source static ffmpeg/shaderc, so they compile once, not twice). The
-# webview variant needs ubuntu:22.04 (webkit2gtk-4.1) and stays separate.
-# Shared setup + the cargo/target cache live in .github/actions/release-setup.
+# Job shape: default + web-cef build IN ONE JOB on a local org runner (the
+# focal-based runner image IS the glibc 2.31 floor debian:11 used to provide;
+# the runners have no docker, so containers are out anyway). Same target dir -
+# the web build reuses the whole dependency graph incl. the from-source static
+# ffmpeg/shaderc, so they compile once, not twice. The webview variant runs on
+# the jammy runner pool (webkit2gtk-4.1, glibc 2.35). Shared setup + the
+# cargo/target cache live in .github/actions/release-setup; a glibc-floor
+# guard fails the build if the runner image ever drifts.
 on:
   workflow_dispatch:
     inputs:
@@ -104,26 +107,24 @@ jobs:
             libshaderc-dev glslang-dev
       - run: cargo test --workspace
 
-  # 2. default + web-cef in one debian:11 job (glibc 2.31 floor). The default
+  # 2. default + web-cef in one focal-runner job (glibc 2.31 floor). The default
   #    build compiles the full portable dependency graph (static ffmpeg +
   #    shaderc); the web-cef build on top only adds the web crates + the two
   #    CEF-linked binaries. Both artifacts upload from here.
   build-linux:
     needs: [prepare, test]
-    runs-on: ubuntu-latest
-    container: debian:11
+    # Local org runner, focal-based image = glibc 2.31 - the same portability
+    # floor debian:11 gave us, without a container (the runners have no
+    # docker). 5.5 cores + local disk vs the 2-core hosted VM.
+    runs-on: [self-hosted, glibc231-focal]
     defaults:
       run:
         shell: bash
     steps:
-      - name: Install git (checkout prerequisite in a bare container)
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates
       - uses: actions/checkout@v4
       - uses: ./.github/actions/release-setup
         with:
-          cache-key: release-debian11
+          cache-key: release-focal
 
       - name: Set crate version
         run: |
@@ -147,6 +148,13 @@ jobs:
             echo "::error::engine links libcef — the browser must stay out-of-process (kirie-webhost)"; exit 1
           fi
           echo "ok: ffmpeg + shaderc static; no libcef in the engine"
+          # The glibc floor now comes from the runner image (focal) - fail loudly
+          # if the image ever moves and silently raises the floor.
+          floor=$(objdump -T target/release/kirie | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "glibc floor: $floor"
+          case "$floor" in GLIBC_2.3[01]|GLIBC_2.[0-9]|GLIBC_2.[12][0-9]) ;; *)
+            echo "::error::glibc floor rose to $floor (runner image drift?) - portable promise is >=2.31"; exit 1;;
+          esac
 
       - name: Package default tarball
         run: |
@@ -184,20 +192,17 @@ jobs:
   # 3. webview variant: ubuntu:22.04 ships webkit2gtk-4.1 (debian:11 only 4.0).
   build-webview:
     needs: [prepare, test]
-    runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    # Local org runner, jammy-based image (22.04): webkit2gtk-4.1 + the same
+    # glibc 2.35 floor the ubuntu:22.04 container had.
+    runs-on: [self-hosted, pipewire-jammy]
     defaults:
       run:
         shell: bash
     steps:
-      - name: Install git (checkout prerequisite in a bare container)
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates
       - uses: actions/checkout@v4
       - uses: ./.github/actions/release-setup
         with:
-          cache-key: release-ubuntu2204
+          cache-key: release-jammy
           extra-apt: libwebkit2gtk-4.1-dev libsoup-3.0-dev
 
       - name: Set crate version
