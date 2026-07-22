@@ -118,6 +118,15 @@ fn manager_lock() -> std::sync::MutexGuard<'static, Option<Manager>> {
     MANAGER.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A detached last-backend teardown in flight (see [`CefBackend::shutdown`]).
+/// [`CefBackend::new`] joins it before re-initializing so `cef_shutdown` and
+/// `cef_initialize` can never overlap.
+static TEARDOWN: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+fn teardown_lock() -> std::sync::MutexGuard<'static, Option<JoinHandle<()>>> {
+    TEARDOWN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Ask the CEF thread to quit and join it, clearing the global slot.
 fn stop_thread(guard: &mut Option<Manager>) {
     if let Some(mut mgr) = guard.take() {
@@ -162,6 +171,13 @@ impl WebBackend for CefBackend {
             size: shared_size,
             reply: reply_tx,
         };
+
+        // A detached last-backend teardown may still be running cef_shutdown;
+        // join it first so initialize can never overlap shutdown (the segfault
+        // window of rapid web-to-none-to-web switches).
+        if let Some(handle) = teardown_lock().take() {
+            let _ = handle.join();
+        }
 
         // Serialize thread spawn/reuse and the create round-trip: the lock is
         // held until the browser exists so a concurrent shutdown of the last
@@ -276,20 +292,31 @@ impl WebBackend for CefBackend {
         }
         self.closed = true;
 
-        // Close this browser (the shared context stays up for siblings) and
-        // wait — bounded — for the ack so the browser is really gone before we
-        // decide whether the context itself should come down.
-        let (done_tx, done_rx) = channel();
-        if self.tx.send(Command::Close(self.id, done_tx)).is_ok() {
-            let _ = done_rx.recv_timeout(CLOSE_WAIT);
-        }
+        // Close this browser fire-and-forget: `shutdown` runs on the RENDER
+        // thread (a swapped-out renderer drops there), and blocking on a close
+        // ack froze compositing for up to CLOSE_WAIT during rapid web↔web /
+        // web↔scene switches. The pump honours queued closes in order, so the
+        // browser still goes down; siblings keep the context.
+        let (done_tx, _done_rx) = channel();
+        let _ = self.tx.send(Command::Close(self.id, done_tx));
 
-        // Last backend out tears the whole context down.
+        // Last backend out tears the whole context down — on a DETACHED thread:
+        // `Quit` + join can take a second of cef_shutdown, which must never run
+        // on the render thread. `CefBackend::new` joins this handle before any
+        // re-init, so shutdown/initialize can never overlap.
         let mut guard = manager_lock();
         if let Some(mgr) = guard.as_mut() {
             mgr.live = mgr.live.saturating_sub(1);
-            if mgr.live == 0 {
-                stop_thread(&mut guard);
+            if mgr.live == 0
+                && let Some(mut mgr) = guard.take()
+            {
+                let handle = std::thread::spawn(move || {
+                    let _ = mgr.tx.send(Command::Quit);
+                    if let Some(thread) = mgr.thread.take() {
+                        let _ = thread.join();
+                    }
+                });
+                *teardown_lock() = Some(handle);
             }
         }
     }
@@ -360,11 +387,16 @@ fn cef_thread_main(config: ThreadConfig) {
     let frame_dt = Duration::from_secs_f64(1.0 / f64::from(FRAME_RATE));
     let audio_zero = [0.0f32; 128];
 
+    // Pump iterations to let CEF settle a browser teardown before the next
+    // command (esp. a Create) is drained — interleaving a synchronous create
+    // with an in-flight async close is the observed segfault window.
+    let mut settle: u32 = 0;
+
     'pump: loop {
         let frame_start = Instant::now();
 
         // Drain pending commands.
-        loop {
+        while settle == 0 {
             match rx.try_recv() {
                 Ok(Command::Create(req)) => match create_browser(&req) {
                     Some(browser) => {
@@ -403,6 +435,9 @@ fn cef_thread_main(config: ThreadConfig) {
                 Ok(Command::Close(id, done)) => {
                     if let Some(entry) = registry.remove(id) {
                         close_browser(entry.browser);
+                        // Let a few message-loop iterations run before the next
+                        // command (esp. a Create) so the teardown settles.
+                        settle = 4;
                     }
                     let _ = done.send(());
                 }
@@ -420,6 +455,8 @@ fn cef_thread_main(config: ThreadConfig) {
 
         // Pump CEF once; every browser's OnPaint fires here on this thread.
         do_message_loop_work();
+        settle = settle.saturating_sub(1);
+        settle = settle.saturating_sub(1);
 
         // Pace to the target frame rate.
         if let Some(rem) = frame_dt.checked_sub(frame_start.elapsed()) {

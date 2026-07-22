@@ -280,6 +280,10 @@ fn apply_command(state: &mut AppState, command: Command) -> CommandOutcome {
         // the platform has no command channel (X11 / not up) or the path isn't a
         // runnable non-web wallpaper.
         Command::Bg { screen, path } => {
+            // A pending debounced property-rebuild captured the PREVIOUS
+            // wallpaper's path at schedule time; firing after this switch would
+            // swap the old wallpaper back in. Invalidate it.
+            state.prop_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let sc = state
                 .swap
                 .lock()
