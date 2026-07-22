@@ -69,6 +69,56 @@ pub fn trim_heap() {
     }
 }
 
+/// Evict cold library pages from RSS (`madvise(MADV_PAGEOUT)`).
+///
+/// The NVIDIA Vulkan userspace keeps ~100MB of library code resident that is
+/// only needed in bursts: `libnvidia-gpucomp` (shader compiler — used only
+/// while building a wallpaper's pipelines), `libnvidia-rtcore` (raytracing —
+/// never used), the SPIR-V compiler, and `libcef` (idle unless a web
+/// wallpaper is showing). After a build settles, page them out: the kernel
+/// reclaims the clean file-backed pages immediately instead of "eventually",
+/// and they refault transparently from the page cache/disk on next use (the
+/// next wallpaper build — already a >100ms operation). Dirty pages are left
+/// alone by the kernel where not swappable; correctness is unaffected either
+/// way — this is purely an RSS/reclaim hint.
+pub fn pageout_cold_libs() {
+    const COLD: &[&str] = &[
+        "libnvidia-gpucomp",
+        "libnvidia-rtcore",
+        "libnvidia-glvkspirv",
+        "libcef.so",
+    ];
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return;
+    };
+    for line in maps.lines() {
+        let Some(path) = line.split_whitespace().nth(5) else {
+            continue;
+        };
+        if !COLD.iter().any(|c| path.contains(c)) {
+            continue;
+        }
+        let Some((range, _)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some((a, b)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16))
+        else {
+            continue;
+        };
+        if end <= start {
+            continue;
+        }
+        // SAFETY: MADV_PAGEOUT is an eviction hint on our own mapping — it
+        // never unmaps or alters contents; evicted pages refault on access.
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_PAGEOUT);
+        }
+    }
+}
+
 /// Memory-map a file read-only, boxed as opaque bytes.
 ///
 /// This lives here because kirie-bake is the one crate with the §V2 `unsafe`

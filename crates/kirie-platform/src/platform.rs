@@ -384,8 +384,11 @@ impl PlatformState {
         // The old renderer just freed its CPU-side state (decoded assets,
         // script heaps, staging buffers) — return those pages to the kernel
         // now rather than letting glibc hoard them until the next build. GPU
-        // resources already unmapped via the wgpu drop chain above.
+        // resources already unmapped via the wgpu drop chain above. Burst-use
+        // driver libraries (shader compiler etc.) get paged out too; they
+        // refault at the next build.
         kirie_bake::trim_heap();
+        kirie_bake::pageout_cold_libs();
         tracing::info!(output = %ctx.name, "wallpaper swapped in");
     }
 
@@ -682,6 +685,11 @@ impl PlatformState {
                 height = ctx.physical_size.height,
                 "first frame presented"
             );
+            // Initial build settled: drop the build-burst pages (glibc arenas
+            // + shader-compiler/raytracing driver libs) from RSS. Swaps do the
+            // same in install_renderer.
+            kirie_bake::trim_heap();
+            kirie_bake::pageout_cold_libs();
         }
     }
 
