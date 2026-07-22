@@ -279,6 +279,9 @@ pub struct SceneRenderer {
     parallax_disp: [f32; 2],
     /// The shared text pipeline, built only when the scene has drawable text.
     text_pipeline: Option<TextPipeline>,
+    /// Retained font system for script-driven text re-rasterization (`None`
+    /// when the scene has no text objects).
+    text_fonts: Option<TextFonts>,
     scene_fbo: Fbo,
     /// Persistent snapshot of `scene_fbo` bound wherever a layer samples
     /// `_rt_FullFrameBuffer` (docs §6/§11). Refreshed by a GPU copy immediately
@@ -691,7 +694,22 @@ impl SceneRenderer {
 
         // Build the SceneScript host from the resolved model (docs §3). `None`
         // when the scene has no driveable property script (the common case).
-        let script = ScriptHost::build(model, (proj_w, proj_h), user_props);
+        let mut script = ScriptHost::build(model, (proj_w, proj_h), user_props);
+
+        // Wire text-layer scripts (WE clock/date drivers): create each text
+        // object's layer script in the host; render() ticks them and
+        // re-rasterizes on string change (`CText::initScriptLayer` parity).
+        if let Some(host) = script.as_mut() {
+            for item in &mut items {
+                if let SceneItem::Text(tg) = item {
+                    let initial = tg.current_text().to_owned();
+                    if let Some(ts) = tg.script.as_mut() {
+                        ts.handle =
+                            host.create_text_layer(&ts.source, ts.properties.clone(), &initial);
+                    }
+                }
+            }
+        }
 
         // Allocate the models' shared depth buffer once, only when the scene has
         // a model object (SPEC.md §V5: no per-frame alloc; §7.2).
@@ -727,6 +745,7 @@ impl SceneRenderer {
             runtime_seq: 0,
             runtime_pipeline: None,
             text_pipeline,
+            text_fonts,
             scene_fbo,
             scene_snapshot,
             bloom,
@@ -1650,6 +1669,25 @@ impl Renderer for SceneRenderer {
             }
             apply_runtime_updates(&mut self.runtime_layers, &updates);
             apply_script_updates(&mut self.items, &updates);
+        }
+
+        // Script-driven text layers (clock/date drivers): tick each and
+        // re-rasterize only when the rendered string changed (`CText`'s
+        // rebuildTextureFrom-on-change).
+        if let (Some(host), Some(tp), Some(fonts)) = (
+            self.script.as_mut(),
+            self.text_pipeline.as_ref(),
+            self.text_fonts.as_mut(),
+        ) {
+            let elapsed = self.elapsed;
+            for item in &mut self.items {
+                if let SceneItem::Text(tg) = item
+                    && let Some(handle) = tg.script.as_ref().and_then(|s| s.handle)
+                    && let Some(new_text) = host.tick_text_layer(handle, elapsed, f64::from(dt))
+                {
+                    tg.retext(&self.device, &self.queue, tp, fonts, &new_text);
+                }
+            }
         }
 
         // Recompute the blit UV window on resize (docs §4; cached like the

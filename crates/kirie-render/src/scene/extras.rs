@@ -70,6 +70,127 @@ pub struct TextGpu {
     pub vertex_buffer: wgpu::Buffer,
     /// The uploaded coverage texture, kept alive alongside the bind group.
     _texture: GpuTexture,
+    /// The text-layer script binding (a WE clock/date script driving the
+    /// string per frame, `CText::initScriptLayer`), if the object has one.
+    /// `handle` is wired after the scene's script host starts.
+    pub script: Option<TextScriptState>,
+    /// Everything needed to re-rasterize the quad when the script changes the
+    /// string (see [`TextGpu::retext`]).
+    rebuild: TextRebuild,
+    /// The uniform buffer (mvp + color), reused across retexts.
+    ubo: wgpu::Buffer,
+}
+
+/// A text object's script driver (docs §7.2): source + scriptproperties from
+/// the scene JSON, and the live layer handle once created.
+pub struct TextScriptState {
+    /// JS source of the layer script.
+    pub source: String,
+    /// The script's `scriptproperties` blob.
+    pub properties: serde_json::Value,
+    /// Script-engine layer handle (`None` until wired / on failure).
+    pub handle: Option<u32>,
+}
+
+/// Re-rasterization context retained per text object.
+struct TextRebuild {
+    current: String,
+    font: String,
+    pointsize: f32,
+    compensate: f32,
+    size: [f32; 2],
+    halign: String,
+    valign: String,
+    padding: f32,
+    scale: [f32; 2],
+    origin: [f32; 2],
+    scene_size: (u32, u32),
+    bundled: Option<String>,
+}
+
+impl TextGpu {
+    /// The string currently rasterized.
+    #[must_use]
+    pub fn current_text(&self) -> &str {
+        &self.rebuild.current
+    }
+
+    /// Re-rasterize with `new_text` (a script changed the string): new
+    /// coverage texture + quad + bind group, reusing the pipeline, fonts and
+    /// uniform buffer. No-ops when the string is unchanged; keeps the old
+    /// visuals when the new string rasterizes to nothing (whitespace).
+    pub fn retext(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tp: &TextPipeline,
+        fonts: &mut TextFonts,
+        new_text: &str,
+    ) {
+        if new_text == self.rebuild.current {
+            return;
+        }
+        self.rebuild.current = new_text.to_owned();
+        let rb = &self.rebuild;
+        let Some(raster) = text::rasterize(
+            fonts,
+            &rb.current,
+            &rb.font,
+            rb.pointsize * rb.compensate,
+            [rb.size[0] * rb.compensate, rb.size[1] * rb.compensate],
+            &rb.halign,
+            &rb.valign,
+            rb.padding * rb.compensate,
+            rb.bundled.as_deref(),
+        ) else {
+            return;
+        };
+        if !raster.any_coverage {
+            return;
+        }
+        let texture = text::upload(device, queue, &raster);
+        // Quad = rasterized block × object scale, exactly the reference
+        // (CText render): rasterizing at `pointsize × compensate` and then
+        // scaling down by the sub-1 object scale lands the glyphs at their
+        // intended on-screen size (CText.cpp:203-212).
+        let sx = raster.width as f32 * rb.scale[0];
+        let sy = raster.height as f32 * rb.scale[1];
+        let quad = scene_space_quad(rb.origin[0], rb.origin[1], sx, sy, rb.scene_size);
+        let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+        let mut verts = Vec::with_capacity(4 * 20);
+        for (p, uv) in quad.iter().zip(uvs.iter()) {
+            for &f in p {
+                verts.extend_from_slice(&f.to_le_bytes());
+            }
+            for &f in uv {
+                verts.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        self.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("kirie-scene-text-vb"),
+            contents: &verts,
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        self.bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kirie-scene-text-bg"),
+            layout: &tp.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                },
+            ],
+        });
+        self._texture = texture;
+    }
 }
 
 /// The shared glyph pipeline every [`TextGpu`] draws with (built once when the
@@ -287,15 +408,27 @@ pub fn build_text(
     // Load the wallpaper's own packaged font (docs §13) so shaping uses it
     // instead of a system substitute; `None` keeps the fallback path.
     let bundled = fonts.bundled_family(&tobj.font, source);
+    // WE text objects often pair a modest pointsize with a sub-1 object scale
+    // (0.09–0.9); rasterizing at the raw pointsize and then scaling the quad
+    // down renders ~2–10px glyphs (invisible/tiny). The reference compensates
+    // by rasterizing at `pointsize / avgScale` so the post-scale on-screen
+    // size matches the intended pointsize (CText.cpp:203-212). The box/padding
+    // scale with it so alignment stays proportional.
+    let avg_scale = (tobj.scale.value[0] + tobj.scale.value[1]) * 0.5;
+    let compensate = if avg_scale > 0.0 && avg_scale < 1.0 {
+        (1.0 / avg_scale).min(32.0)
+    } else {
+        1.0
+    };
     let raster = text::rasterize(
         fonts,
         &tobj.text.value,
         &tobj.font,
-        tobj.pointsize.value,
-        tobj.size,
+        tobj.pointsize.value * compensate,
+        [tobj.size[0] * compensate, tobj.size[1] * compensate],
         &tobj.horizontalalign,
         &tobj.verticalalign,
-        tobj.padding as f32,
+        tobj.padding as f32 * compensate,
         bundled.as_deref(),
     )?;
     // Nothing visible would draw (whitespace-only text, or no font faces
@@ -306,7 +439,8 @@ pub fn build_text(
     let texture = text::upload(device, queue, &raster);
 
     // Scene-space quad: the coverage block's pixel size × object scale, centered
-    // on the origin (docs §7.1). One texel = one scene pixel at build time.
+    // on the origin (docs §7.1) — the compensation above makes the scaled-down
+    // block land at the intended pointsize.
     let sx = raster.width as f32 * tobj.scale.value[0];
     let sy = raster.height as f32 * tobj.scale.value[1];
     let origin = object.base.origin.value;
@@ -367,6 +501,26 @@ pub fn build_text(
         bind,
         vertex_buffer,
         _texture: texture,
+        script: tobj.text.script.as_ref().map(|sb| TextScriptState {
+            source: sb.source.clone(),
+            properties: serde_json::Value::Object(sb.properties.clone()),
+            handle: None,
+        }),
+        rebuild: TextRebuild {
+            current: tobj.text.value.clone(),
+            font: tobj.font.clone(),
+            pointsize: tobj.pointsize.value,
+            compensate,
+            size: tobj.size,
+            halign: tobj.horizontalalign.clone(),
+            valign: tobj.verticalalign.clone(),
+            padding: tobj.padding as f32,
+            scale: [tobj.scale.value[0], tobj.scale.value[1]],
+            origin: [origin[0], origin[1]],
+            scene_size,
+            bundled,
+        },
+        ubo,
     })
 }
 

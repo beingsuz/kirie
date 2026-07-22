@@ -258,7 +258,13 @@ impl ScriptHost {
             }
         }
 
-        if pending.is_empty() {
+        // Text-layer scripts (WE clock/date drivers on a text object's `text`
+        // setting, docs §7.2) also need the engine — a scene with only those
+        // and no property scripts must still spawn it.
+        let has_text_scripts = model.scene.objects.iter().any(|o| {
+            matches!(&o.kind, kirie_scene::object::ObjectKind::Text(t) if t.text.script.is_some())
+        });
+        if pending.is_empty() && !has_text_scripts {
             return None;
         }
 
@@ -313,6 +319,32 @@ impl ScriptHost {
             user_props_dirty: false,
             last_tick: std::time::Instant::now(),
         })
+    }
+
+    /// Create a text-layer script (a WE clock/date driver on a text object,
+    /// docs §7.2). Returns the layer handle, `None` on failure (the text then
+    /// just keeps its literal string — V9 degrade).
+    pub fn create_text_layer(
+        &mut self,
+        source: &str,
+        properties: serde_json::Value,
+        initial_text: &str,
+    ) -> Option<u32> {
+        match self.engine.create_layer_script(source, properties, initial_text) {
+            Ok(h) if h != 0 => Some(h),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!(error = %e, "text layer script failed to load");
+                None
+            }
+        }
+    }
+
+    /// Tick a text-layer script and read back its current rendered string
+    /// (docs §7.2: deferred `init`, then `update(text)`).
+    pub fn tick_text_layer(&mut self, handle: u32, time: f64, dt: f64) -> Option<String> {
+        let _ = self.engine.tick_layer(handle, time, dt, 60.0);
+        self.engine.layer_text(handle).ok()
     }
 
     /// Advance one frame: marshal a [`HostFrame`], tick the engine, and return
