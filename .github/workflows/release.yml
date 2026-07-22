@@ -4,7 +4,8 @@ name: Release
 # It computes the version + changelog, gates on the full test suite, builds the
 # artifacts, and creates the draft with all of them + notes attached in one shot.
 #
-# Artifacts (all with ffmpeg + shaderc statically linked via `--features portable`):
+# Artifacts: three STANDALONE executables, no tarballs (chmod +x after
+# download; all with ffmpeg + shaderc statically linked via `--features portable`):
 #   kirie              - portable single binary. Only universal dynamic deps
 #                        (glibc, alsa, pulse, xcb); runs on any distro (glibc>=2.31).
 #   kirie-web-cef      - SINGLE self-extracting file with bundled Chromium: the
@@ -156,14 +157,8 @@ jobs:
             echo "::error::glibc floor rose to $floor (runner image drift?) - portable promise is >=2.31"; exit 1;;
           esac
 
-      - name: Package default tarball
-        run: |
-          set -euo pipefail
-          dist="dist/kirie"
-          mkdir -p "$dist"
-          cp target/release/kirie "$dist/kirie"
-          cp README.md LICENSE "$dist/" 2>/dev/null || true
-          tar -C dist -czf kirie-linux-x86_64.tar.gz kirie
+      - name: Stage default binary
+        run: cp target/release/kirie kirie-linux-x86_64
 
       - name: Build web-cef (engine + helper + webhost)
         run: |
@@ -181,7 +176,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: kirie-linux-x86_64
-          path: kirie-linux-x86_64.tar.gz
+          path: kirie-linux-x86_64
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
@@ -223,20 +218,13 @@ jobs:
           fi
           echo "ok: ffmpeg + shaderc statically linked"
 
-      - name: Package webview tarball
-        run: |
-          set -euo pipefail
-          dist="dist/kirie-web-webview"
-          mkdir -p "$dist"
-          cp target/release/kirie "$dist/kirie-web-webview"
-          cp README.md LICENSE "$dist/" 2>/dev/null || true
-          printf 'Requires webkit2gtk-4.1 and libsoup-3.0 installed on the system.\nDebian/Ubuntu: apt install libwebkit2gtk-4.1-0 libsoup-3.0-0\nArch: pacman -S webkit2gtk-4.1 libsoup3\n\nLIMITATION: webkit2gtk has no offscreen-rendering path (upstream wont-fix),\nso WEB wallpapers cannot render in this variant - scenes/video/images only.\nUse the kirie-web-cef single-file build for web wallpapers.\n' > "$dist/REQUIREMENTS.txt"
-          tar -C dist -czf kirie-web-webview-linux-x86_64.tar.gz kirie-web-webview
+      - name: Stage webview binary
+        run: cp target/release/kirie kirie-web-webview-linux-x86_64
 
       - uses: actions/upload-artifact@v4
         with:
           name: kirie-web-webview-linux-x86_64
-          path: kirie-web-webview-linux-x86_64.tar.gz
+          path: kirie-web-webview-linux-x86_64
           if-no-files-found: error
 
   # 4. Create/update the draft release once, with all built artifacts + notes.
@@ -260,9 +248,21 @@ jobs:
       - name: Create or update the draft release
         run: |
           set -euo pipefail
-          # Tarballs (default, web-webview) + the raw self-extracting web-cef
-          # single file (no extension).
+          # Three standalone executables (no archives): kirie, kirie-web-cef
+          # (self-extracting), kirie-web-webview.
           files=$(ls *-linux-x86_64*)
+          cat >> RELEASE_NOTES.md <<'EOF'
+
+          ## Downloads
+
+          All assets are standalone executables — download, `chmod +x`, run.
+
+          | File | Variant |
+          | --- | --- |
+          | `kirie-linux-x86_64` | scenes + video + images |
+          | `kirie-web-cef-linux-x86_64` | + web wallpapers, bundled Chromium (self-extracting, no system deps) |
+          | `kirie-web-webview-linux-x86_64` | + system webkit2gtk — needs `libwebkit2gtk-4.1` + `libsoup-3.0` installed; webkit has no offscreen path (upstream won't-fix), so web wallpapers do NOT composite: scenes/video/images only. Prefer the cef build for web. |
+          EOF
           echo "attaching:"; echo "$files"
           # No checkout here, so gh must stay API-only: GH_REPO gives the repo and
           # --target gives create an explicit commit. Update in place if it exists.
