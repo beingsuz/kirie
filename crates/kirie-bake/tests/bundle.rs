@@ -105,9 +105,14 @@ fn lru_gc_evicts_oldest_accessed_first() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     cache.bake(b"item-new", big(3)).unwrap();
 
-    // Touch the two newer ones so "old" is the LRU victim.
+    // Touch the two newer ones so "old" is the LRU victim. The sleep BETWEEN
+    // the loads matters: kernel file timestamps tick on the coarse clock
+    // (~1-10 ms), so two back-to-back touches can land the identical
+    // nanosecond — the LRU sort then tie-breaks by readdir (hash) order and
+    // may evict the newer one.
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(cache.load(b"item-mid").unwrap().is_some());
+    std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(cache.load(b"item-new").unwrap().is_some());
 
     // Cap that forces evicting ~one bundle (each ≥300KB; cap 500KB).
