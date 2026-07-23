@@ -16,13 +16,15 @@ name: Release
 #                        no system browser; self-extracts to cache on first run.
 #                        The ENGINE binary links no libcef - the browser runs
 #                        out-of-process in kirie-webhost.
-#   kirie-web-webview  - + wry/system webkit2gtk-4.1. Smaller, but REQUIRES the
-#                        target to have webkit2gtk-4.1 + libsoup-3.0 installed
-#                        (webkit can't be bundled). Built on glibc 2.35.
-#                        NOTE: webkit2gtk has NO offscreen-rendering path
-#                        (upstream won't-fix), so web wallpapers cannot
-#                        composite in this variant - it is scenes/video only.
-#                        Prefer kirie-web-cef for working web wallpapers.
+#   kirie-web-webview  - + web wallpapers via the system webkit2gtk-4.1,
+#                        presented natively on the compositor's background
+#                        layer by the kirie-webviewhost helper (webkit has no
+#                        offscreen path, so instead of compositing frames the
+#                        host owns a gtk-layer-shell window). Two files: the
+#                        engine + kirie-webviewhost beside it. REQUIRES
+#                        webkit2gtk-4.1 + libsoup-3.0 + gtk-layer-shell
+#                        installed; Wayland only for web items. Built on
+#                        glibc 2.35.
 #
 # No Windows artifacts: kirie's presentation layer is Linux-native (Wayland
 # wlr-layer-shell + X11 fallback, PulseAudio, memfd) - on Windows the original
@@ -198,17 +200,19 @@ jobs:
       - uses: ./.github/actions/release-setup
         with:
           cache-key: release-jammy
-          extra-apt: libwebkit2gtk-4.1-dev libsoup-3.0-dev
+          extra-apt: libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-layer-shell-dev
 
       - name: Set crate version
         run: |
           v="${{ needs.prepare.outputs.version }}"; v="${v#v}"
           sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/s//version = \"$v\"/" Cargo.toml
 
-      - name: Build web-webview (portable)
-        run: cargo build --release -p kirie --features portable,web-webview
+      - name: Build web-webview (portable engine + native-layer host)
+        run: |
+          cargo build --release -p kirie --features portable,web-webview
+          cargo build --release -p kirie-web --features webview --bin kirie-webviewhost
 
-      - name: Verify static deps
+      - name: Verify static deps + engine stays webkit-free
         run: |
           set -euo pipefail
           needed="$(readelf -d target/release/kirie | grep NEEDED || true)"
@@ -216,15 +220,26 @@ jobs:
           if echo "$needed" | grep -iqE 'libav|libsw|shaderc|glslang'; then
             echo "::error::churny soname present — ffmpeg/shaderc not static"; exit 1
           fi
-          echo "ok: ffmpeg + shaderc statically linked"
+          # The engine is only the process client; webkit/gtk live in the host.
+          if echo "$needed" | grep -iqE 'webkit|libgtk|libsoup'; then
+            echo "::error::engine links webkit/gtk — the browser must stay in kirie-webviewhost"; exit 1
+          fi
+          echo "ok: ffmpeg + shaderc static; engine webkit-free"
 
-      - name: Stage webview binary
-        run: cp target/release/kirie kirie-web-webview-linux-x86_64
+      - name: Stage webview binaries
+        run: |
+          cp target/release/kirie kirie-web-webview-linux-x86_64
+          cp target/release/kirie-webviewhost kirie-webviewhost-linux-x86_64
 
       - uses: actions/upload-artifact@v4
         with:
           name: kirie-web-webview-linux-x86_64
           path: kirie-web-webview-linux-x86_64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kirie-webviewhost-linux-x86_64
+          path: kirie-webviewhost-linux-x86_64
           if-no-files-found: error
 
   # 4. Create/update the draft release once, with all built artifacts + notes.
@@ -261,7 +276,8 @@ jobs:
           | --- | --- |
           | `kirie-linux-x86_64` | scenes + video + images |
           | `kirie-web-cef-linux-x86_64` | + web wallpapers, bundled Chromium (self-extracting, no system deps) |
-          | `kirie-web-webview-linux-x86_64` | + system webkit2gtk — needs `libwebkit2gtk-4.1` + `libsoup-3.0` installed; webkit has no offscreen path (upstream won't-fix), so web wallpapers do NOT composite: scenes/video/images only. Prefer the cef build for web. |
+          | `kirie-web-webview-linux-x86_64` | + web wallpapers via the system webkit, presented natively on the compositor's background layer. Download `kirie-webviewhost-linux-x86_64` too, rename it `kirie-webviewhost` and keep it beside the engine. Needs `webkit2gtk-4.1`, `libsoup3`, `gtk-layer-shell` installed; web items are Wayland-only. |
+          | `kirie-webviewhost-linux-x86_64` | the webview build's webkit host helper (required by the webview engine for web items) |
           EOF
           echo "attaching:"; echo "$files"
           # No checkout here, so gh must stay API-only: GH_REPO gives the repo and
